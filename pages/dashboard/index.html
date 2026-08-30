@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="light">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>群务管家</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <div class="layout">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">群</div>
+          <div class="brand-text">
+            <span class="brand-title" id="brand-title">群务管家</span>
+            <span class="brand-version" id="brand-version">加载中…</span>
+          </div>
+        </div>
+        <nav class="nav" id="nav" aria-label="导航"></nav>
+        <div class="sidebar-foot">
+          <button class="btn small" id="btn-theme" type="button">切换深浅色</button>
+          <button class="btn small" id="btn-reload" type="button">刷新数据</button>
+        </div>
+      </aside>
+      <main class="main" id="main">
+        <div class="loading">正在连接插件接口…</div>
+      </main>
+    </div>
+    <div class="toast-host" id="toast-host" aria-live="polite"></div>
+    <script src="./app.js"></script>
+  </body>
+</html>
