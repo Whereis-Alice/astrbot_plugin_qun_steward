@@ -324,6 +324,12 @@
     "hint": "怪话图渲染需要中文字体。默认会依次尝试：自定义路径 → 插件数据目录 → 系统字体。",
     "type": "object",
     "items": {
+      "custom_emoji_font_path": {
+        "description": "自定义彩色 emoji 字体路径",
+        "hint": "留空表示自动查找（Windows seguiemj、macOS Apple Color Emoji、Linux NotoColorEmoji）。找不到时 emoji 会用正文字体绘制。",
+        "type": "string",
+        "default": ""
+      },
       "custom_font_path": {
         "description": "自定义常规字体路径",
         "hint": "留空表示自动查找。",

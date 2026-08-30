@@ -51,6 +51,55 @@ class TestMetadata:
         assert plugin_dir.name == PLUGIN_NAME
 
 
+class TestRequirements:
+    """依赖清单的硬约束。
+
+    AstrBot 4.27+ 在加载插件前会真的 import 插件私有 site-packages 里的
+    依赖模块做预检；一旦某个包和运行时版本不兼容就直接拒绝加载整个插件。
+    pilmoji 2.0.4 只兼容 emoji 1.x，而 AstrBot 运行时带 emoji>=2，
+    两者同时出现会让插件装不上，因此彩色 emoji 改为自研实现。
+    """
+
+    #: 绝不能重新出现在 requirements.txt 里的包
+    FORBIDDEN = ("pilmoji", "emoji")
+
+    @pytest.fixture
+    def requirements(self, plugin_dir: Path) -> list[str]:
+        raw = (plugin_dir / "requirements.txt").read_text(encoding="utf-8")
+        return [line.strip() for line in raw.splitlines() if line.strip() and not line.startswith("#")]
+
+    def test_no_conflicting_packages(self, requirements: list[str]) -> None:
+        for line in requirements:
+            name = re.split(r"[<>=!~[; ]", line, maxsplit=1)[0].strip().lower()
+            assert name not in self.FORBIDDEN, (
+                f"{name} 会触发 AstrBot 依赖预检冲突，导致插件无法安装：{line}"
+            )
+
+    def test_expected_packages_present(self, requirements: list[str]) -> None:
+        names = {re.split(r"[<>=!~[; ]", line, maxsplit=1)[0].strip().lower() for line in requirements}
+        assert {"aiosqlite", "apscheduler", "aiohttp", "pillow"} <= names
+
+    def test_no_pinned_upper_bound_on_pillow(self, requirements: list[str]) -> None:
+        """Pillow 用下限而非固定版本，避免和宿主环境已装的版本互斥。"""
+        pillow = next(line for line in requirements if line.lower().startswith("pillow"))
+        assert "==" not in pillow
+
+
+class TestSourceHygiene:
+    def test_no_pilmoji_import_left_in_source(self, plugin_dir: Path) -> None:
+        offenders = []
+        for path in sorted(plugin_dir.rglob("*.py")):
+            if "tests" in path.parts or path.name.startswith("_probe"):
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "pilmoji" in text.lower() and "import" in text.lower():
+                for line in text.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith(("import ", "from ")) and "pilmoji" in stripped.lower():
+                        offenders.append(f"{path.name}: {stripped}")
+        assert not offenders, f"仍有 pilmoji 导入：{offenders}"
+
+
 class TestConfSchema:
     def test_group_default_items_match_field_labels(self, schema: dict[str, Any]) -> None:
         items = set(schema["default"]["items"])
@@ -145,6 +194,39 @@ class TestWebUi:
         html = (plugin_dir / "pages/dashboard/index.html").read_text(encoding="utf-8")
         assert "app.js" in html
         assert "style.css" in html
+
+    def test_index_html_declares_ids_used_by_app_js(self, plugin_dir: Path) -> None:
+        """app.js 通过 getElementById 拿外壳节点，缺一个就是整页白屏。"""
+        page_dir = plugin_dir / "pages/dashboard"
+        app_js = page_dir.joinpath("app.js").read_text(encoding="utf-8")
+        html = page_dir.joinpath("index.html").read_text(encoding="utf-8")
+        wanted = set(re.findall(r'getElementById\("([^"]+)"\)', app_js))
+        assert wanted, "未能从 app.js 提取到任何 element id"
+        missing = sorted(name for name in wanted if f'id="{name}"' not in html)
+        assert not missing, f"index.html 缺少 app.js 需要的 id：{missing}"
+
+    def test_style_css_covers_classes_used_by_app_js(self, plugin_dir: Path) -> None:
+        """避免 app.js 改了结构而皮肤没跟上，出现没有样式的裸元素。"""
+        page_dir = plugin_dir / "pages/dashboard"
+        app_js = page_dir.joinpath("app.js").read_text(encoding="utf-8")
+        css = page_dir.joinpath("style.css").read_text(encoding="utf-8")
+        tokens: set[str] = set()
+        for pattern in (r'class:\s*"([^"]*)"', r'\bcls\s*=\s*"([^"]*)"'):
+            for chunk in re.findall(pattern, app_js):
+                tokens.update(part for part in chunk.split() if part)
+        # 三元里拼接的片段，例如 " active" / " overridden"
+        tokens.update(re.findall(r'"\s+([a-z][a-z0-9-]*)"', app_js))
+        assert len(tokens) > 30, "未能从 app.js 提取到足够的 class"
+        missing = sorted(
+            name for name in tokens if not re.search(r"\." + re.escape(name) + r"(?![\w-])", css)
+        )
+        assert not missing, f"style.css 缺少这些 class 的样式：{missing}"
+
+    def test_index_html_uses_relative_assets(self, plugin_dir: Path) -> None:
+        """AstrBot 会重写相对路径并补 asset_token，写死绝对路径会 404。"""
+        html = (plugin_dir / "pages/dashboard/index.html").read_text(encoding="utf-8")
+        assert './style.css' in html
+        assert './app.js' in html
 
     @pytest.mark.parametrize("locale", ["zh-CN", "en-US"])
     def test_i18n_covers_all_app_keys(self, plugin_dir: Path, locale: str) -> None:

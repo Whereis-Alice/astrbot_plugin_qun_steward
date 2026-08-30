@@ -32,6 +32,7 @@
     "time": "时间"
   },
   "common": {
+    "connecting": "正在连接 AstrBot 页面环境…",
     "done": "已更新",
     "empty": "暂无数据",
     "group": "群号",
@@ -40,6 +41,7 @@
     "members": " 人",
     "noChange": "没有需要保存的改动",
     "noSdk": "未检测到 AstrBot 页面运行环境",
+    "noSdkHint": "本页需要由 AstrBot 管理面板打开（插件页会自动注入运行环境）。如果是直接访问 index.html 或页面脚本被拦截，就会出现这种情况。",
     "off": "关闭",
     "on": "开启",
     "onePerLine": "每行一项",
@@ -48,6 +50,7 @@
     "refresh": "刷新",
     "reloadAll": "重新加载数据",
     "reloadGroups": "重新拉取群列表",
+    "reloadPage": "刷新页面",
     "requestFailed": "接口返回失败",
     "retry": "重试",
     "save": "保存改动",

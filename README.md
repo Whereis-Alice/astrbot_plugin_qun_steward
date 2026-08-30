@@ -195,6 +195,8 @@ git clone https://github.com/Whereis-Alice/astrbot_plugin_qun_steward.git
 
 在 AstrBot 插件管理页打开 **群务管家** 即可，无需额外端口与登录，跟随 AstrBot 主题自动适配深浅色，并提供中英文两套文案。
 
+面板皮肤经过整体重制：蓝紫渐变主题（与插件 logo 同色系）、极光背景、侧栏导航、毛玻璃顶栏、骨架屏加载、卡片式统计与自绘开关，窄屏下侧栏会自动折成顶部胶囊导航；开启了系统「减少动态效果」时自动关闭动画。
+
 | 页面 | 用途 |
 | --- | --- |
 | 总览 | 群数量、机器人权限情况、待审进群、审计条数、协议端类型、宵禁状态、近 7 天操作分布 |
@@ -240,6 +242,27 @@ git clone https://github.com/Whereis-Alice/astrbot_plugin_qun_steward.git
 - 可选开启本地备份，上传过的图片同时存一份到插件数据目录。
 - 字体按「自定义路径 → 系统中文字体 → 插件自带 → 下载 → PIL 默认」五级回退，**默认不联网**；需要时可在配置里开启自动下载。
 
+### 会不会被压缩？能上传原图吗
+
+单图上传走的是**原始字节直传**：插件拿到图片后不解码、不重编码、不缩放，只根据文件头判断扩展名，然后原样交给协议端。
+
+但要注意一个前提：插件只能拿到「发送者实际发出的那一份」。QQ 客户端发图时如果没勾选**原图**，压缩在客户端就已经发生了，插件无法还原。想要真原图，请让发送者勾选「原图」发送，或直接以文件形式发送。
+
+另外，`上传群相册 相册名 10` 这种把多条群聊渲染成对话长图的用法，本质是插件自己画出来的新图，会重新编码为 PNG，不属于原图直传。
+
+### Emoji 渲染
+
+「我朋友说」怪话图里的 emoji 由插件自研的零依赖渲染器绘制（`features/album/emoji_text.py`）：按字符簇切分文本，中文/西文交给普通字体，emoji 交给系统彩色字体，再逐段拼回一行。
+
+彩色字体查找顺序：配置项 `custom_emoji_font_path` → 系统字体（Windows `seguiemj.ttf`、macOS `Apple Color Emoji.ttc`、Linux `NotoColorEmoji.ttf`）。找不到彩色字体时会退化为普通字形，不会报错。
+
+已知限制（取决于 Pillow 是否带 Raqm 复杂文本引擎）：
+
+- 无 Raqm 时，ZWJ 组合 emoji（例如 👨‍👩‍👧）会被拆成多个独立 emoji 显示。
+- Windows 自带表情字体不含国旗字形，🇨🇳 之类会显示为浅色的 “CN” 字母对。
+
+> 早期版本用的是 `pilmoji`，它会连带 pin 住老版 `emoji` 库并与 AstrBot 运行时冲突，因此已彻底移除，见下方常见问题。
+
 ## LLM 函数调用
 
 插件提供 15 个函数调用工具（禁言、改名片、头衔、全员禁言、踢人、拉黑、精华、群名、群头像、群公告、群文件等），让大模型在对话中直接完成群务。
@@ -260,6 +283,9 @@ git clone https://github.com/Whereis-Alice/astrbot_plugin_qun_steward.git
 **配置改了不生效？**
 面板保存后即时生效，无需重启。如果改的是「默认模板」，注意已经单独覆写过的群不会被覆盖——去「群配置」看看该群是否带「已覆写」标记。
 
+**安装时报 `Conflicting modules: pilmoji`？**
+完整报错形如 `module 'emoji.unicode_codes' has no attribute 'get_emoji_unicode_dict'`。这是 v1.0.1 及更早版本 pin 的 `pilmoji` + `emoji==1.7.0` 与 AstrBot 运行时里的 `emoji>=2` 不兼容，AstrBot 的依赖预检会因此拒绝加载整个插件。v1.0.2 已移除这两个依赖、改用自研 emoji 渲染，升级到最新版即可；插件现在只依赖 `aiosqlite` / `apscheduler` / `aiohttp` / `pillow`。
+
 **数据存在哪？**
 `data/plugin_data/astrbot_plugin_qun_steward/` 下的 `qun_steward.db`（群配置、审计、待审队列）以及公告图、群文件、相册备份等子目录。卸载插件不会自动删除，可手动清理。
 
@@ -273,6 +299,7 @@ git clone https://github.com/Whereis-Alice/astrbot_plugin_qun_steward.git
 - 协议端自动探测（NapCat / LLOneBot / SnowLuma），非标准接口按能力降级。
 - 批量操作（清理群友等）加并发节流与上限，避免协议端被打爆或触发风控。
 - 修复了一批上游问题：权限键错配、刷屏配置读错字段、纯文字公告发不出、配置重置误删、投票状态内存泄漏、精华与成员列表排版、历史消息扫描量失控等。
+- 依赖精简到 4 个常见包，移除会与 AstrBot 运行时冲突的 `pilmoji`/`emoji`，改用自研零依赖 emoji 渲染。
 - 代码分层重构：`core/` 基础设施、`features/` 业务、`web/` 面板接口，`main.py` 只做编排；全量类型注解，附单元测试。
 
 ## 开发

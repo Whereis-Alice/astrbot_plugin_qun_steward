@@ -1,11 +1,45 @@
 /* 群务管家 WebUI —— 纯原生 JS，无外部依赖。
  * 数据全部来自插件自身的 Web API（web/api.py），通过 AstrBot 注入的
  * window.AstrBotPluginPage 访问，因此不需要手动处理鉴权与路径前缀。
+ *
+ * 注意：AstrBot 是把 bridge-sdk.js 插进返回的 HTML 里的，脚本执行顺序不保证，
+ * 本文件很可能比 SDK 先跑。所以这里一律用 bridge() 惰性取，并在启动时
+ * 用 waitForBridge() 等它就绪，绝不在模块初始化时一次性快照。
  */
 (function () {
   "use strict";
 
-  var page = window.AstrBotPluginPage || null;
+  var BRIDGE_TIMEOUT = 20000;
+  var BRIDGE_POLL = 50;
+
+  /** 惰性获取 AstrBot 注入的桥对象；未就绪时返回 null。 */
+  function bridge() {
+    var api = window.AstrBotPluginPage;
+    return api && typeof api.apiGet === "function" ? api : null;
+  }
+
+  /** 轮询等待桥就绪；超时后 resolve(null)，由调用方决定如何降级。 */
+  function waitForBridge(timeout) {
+    var ready = bridge();
+    if (ready) return Promise.resolve(ready);
+    var deadline = Date.now() + (timeout || BRIDGE_TIMEOUT);
+    return new Promise(function (resolve) {
+      var timer = window.setInterval(function () {
+        var api = bridge();
+        if (api) {
+          window.clearInterval(timer);
+          resolve(api);
+        } else if (Date.now() > deadline) {
+          window.clearInterval(timer);
+          resolve(null);
+        }
+      }, BRIDGE_POLL);
+    });
+  }
+
+  function noBridgeError() {
+    return new Error(t("common.noSdk", "未检测到 AstrBot 页面运行环境"));
+  }
 
   var state = {
     view: "overview",
@@ -22,9 +56,10 @@
   /* ------------------------------------------------------------------ 工具 */
 
   function t(key, fallback) {
-    if (page && typeof page.t === "function") {
+    var api = window.AstrBotPluginPage;
+    if (api && typeof api.t === "function") {
       try {
-        var value = page.t(key, fallback);
+        var value = api.t(key, fallback);
         if (value && value !== key) return value;
       } catch (err) { /* 忽略 i18n 异常，使用回退文案 */ }
     }
@@ -94,18 +129,20 @@
     return payload;
   }
 
+  /** 所有请求都先确认桥已就绪，SDK 晚到也不会把界面卡在报错态。 */
+  function call(method, endpoint, payload) {
+    return waitForBridge().then(function (api) {
+      if (!api || typeof api[method] !== "function") throw noBridgeError();
+      return Promise.resolve(api[method](endpoint, payload || {}));
+    }).then(function (res) { return unwrap(res); });
+  }
+
   function apiGet(endpoint, params) {
-    if (!page || typeof page.apiGet !== "function") {
-      return Promise.reject(new Error(t("common.noSdk", "未检测到 AstrBot 页面运行环境")));
-    }
-    return Promise.resolve(page.apiGet(endpoint, params || {})).then(function (res) { return unwrap(res); });
+    return call("apiGet", endpoint, params);
   }
 
   function apiPost(endpoint, body) {
-    if (!page || typeof page.apiPost !== "function") {
-      return Promise.reject(new Error(t("common.noSdk", "未检测到 AstrBot 页面运行环境")));
-    }
-    return Promise.resolve(page.apiPost(endpoint, body || {})).then(function (res) { return unwrap(res); });
+    return call("apiPost", endpoint, body);
   }
 
   /* ------------------------------------------------------------ 表单控件 */
@@ -245,24 +282,31 @@
 
   function renderMain() {
     var view = currentView();
-    var main = clear(document.getElementById("main"));
-    var actions = el("div", { class: "page-actions" });
-    main.appendChild(el("div", { class: "page-head" }, [
-      el("div", {}, [
-        el("h1", { class: "page-title", text: view.label }),
-        el("p", { class: "page-desc", text: view.desc })
-      ]),
-      actions
-    ]));
-    var body = el("div", {});
-    main.appendChild(body);
-    body.appendChild(el("div", { class: "loading", text: t("common.loading", "加载中…") }));
+    var title = document.getElementById("page-title");
+    var desc = document.getElementById("page-desc");
+    if (title) title.textContent = view.label;
+    if (desc) desc.textContent = view.desc;
+    var actions = clear(document.getElementById("page-actions"));
+    var body = clear(document.getElementById("main"));
+    body.appendChild(skeleton());
     Promise.resolve(view.render(body, actions)).catch(function (err) {
-      clear(body).appendChild(el("div", { class: "card" }, [
-        el("p", { class: "card-note", text: t("common.loadFailed", "数据加载失败：") + (err && err.message ? err.message : err) }),
-        el("button", { class: "btn", type: "button", text: t("common.retry", "重试"), onclick: renderMain })
+      clear(body).appendChild(el("div", { class: "card error-card" }, [
+        el("div", { class: "error-mark", text: "!" }),
+        el("h2", { class: "card-title", text: t("common.loadFailed", "数据加载失败：") }),
+        el("p", { class: "card-note", text: err && err.message ? err.message : String(err) }),
+        el("div", { class: "toolbar", style: "margin:14px 0 0" },
+          el("button", { class: "btn primary", type: "button", text: t("common.retry", "重试"), onclick: renderMain }))
       ]));
     });
+  }
+
+  /** 加载占位：比一行「加载中…」更稳，避免布局跳动。 */
+  function skeleton() {
+    return el("div", { class: "skeleton", "aria-label": t("common.loading", "加载中…") }, [
+      el("div", { class: "sk-row sk-wide" }),
+      el("div", { class: "sk-grid" }, [1, 2, 3, 4].map(function () { return el("div", { class: "sk-card" }); })),
+      el("div", { class: "sk-block" })
+    ]);
   }
 
   function section(title, children, note) {
@@ -313,7 +357,7 @@
         statCard(t("overview.pending", "待审进群"), data.pending_joins || 0, t("overview.pendingHint", "群内发送「待审进群」处理"))
       ]));
 
-      body.appendChild(el("div", { class: "grid cols-4", style: "margin-top:12px" }, [
+      body.appendChild(el("div", { class: "grid cols-4" }, [
         statCard(t("overview.auditTotal", "操作日志"), audit.total || 0, audit.enabled ? t("overview.auditOn", "记录已开启") : t("overview.auditOff", "记录已关闭")),
         statCard(t("overview.backend", "协议端"), plain(data.backend, t("common.unknown", "未探测")), t("overview.backendHint", "napcat / llbot / snowluma 自动识别")),
         statCard(t("overview.undo", "撤销窗口"), (data.undo_window || 0) + "s", t("overview.undoHint", "群内发送「撤销」可回滚")),
@@ -831,6 +875,7 @@
     var version = document.getElementById("brand-version");
     if (title) title.textContent = state.displayName;
     if (version) version.textContent = state.version ? state.version : t("common.ready", "已连接");
+    document.title = state.displayName;
   }
 
   function initTheme() {
@@ -853,7 +898,6 @@
   }
 
   function boot() {
-    initTheme();
     var reload = document.getElementById("btn-reload");
     if (reload) {
       reload.textContent = t("common.reloadAll", "重新加载数据");
@@ -877,15 +921,46 @@
     }).catch(function () { /* ping 失败时由主视图报错 */ });
   }
 
+  /** 桥迟迟不来时给出可操作的诊断，而不是干巴巴一句「未检测到」。 */
+  function showBridgeTimeout() {
+    var body = document.getElementById("main");
+    if (!body) return;
+    clear(body).appendChild(el("div", { class: "card error-card" }, [
+      el("div", { class: "error-mark", text: "!" }),
+      el("h2", { class: "card-title", text: t("common.noSdk", "未检测到 AstrBot 页面运行环境") }),
+      el("p", { class: "card-note", text: t("common.noSdkHint", "本页需要由 AstrBot 管理面板打开（插件页会自动注入运行环境）。如果是直接访问 index.html 或页面脚本被拦截，就会出现这种情况。") }),
+      el("div", { class: "toolbar", style: "margin:14px 0 0" }, [
+        el("button", { class: "btn primary", type: "button", text: t("common.retry", "重试"), onclick: start }),
+        el("button", { class: "btn", type: "button", text: t("common.reloadPage", "刷新页面"), onclick: function () { window.location.reload(); } })
+      ])
+    ]));
+  }
+
   function start() {
-    if (page && typeof page.ready === "function") {
-      Promise.resolve(page.ready()).then(function (info) {
+    initTheme();
+    var body = document.getElementById("main");
+    if (body) {
+      clear(body).appendChild(el("div", { class: "boot" }, [
+        el("div", { class: "boot-spinner" }),
+        el("p", { class: "boot-text", text: t("common.connecting", "正在连接 AstrBot 页面环境…") })
+      ]));
+    }
+    return waitForBridge().then(function (api) {
+      if (!api) { showBridgeTimeout(); return null; }
+      if (typeof api.onContextChange === "function") {
+        try {
+          api.onContextChange(function () { renderNav(); renderMain(); paintBrand(); });
+        } catch (err) { /* 旧版本 SDK 没有这个能力，忽略 */ }
+      }
+      var meta = typeof api.ready === "function"
+        ? Promise.resolve(api.ready()).catch(function () { return null; })
+        : Promise.resolve(null);
+      return meta.then(function (info) {
         if (info && info.displayName) state.displayName = info.displayName;
         boot();
-      }).catch(function () { boot(); });
-    } else {
-      boot();
-    }
+        return info;
+      });
+    });
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", start);

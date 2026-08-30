@@ -2,6 +2,27 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.0.2] - 2026-08-31
+
+修复插件装不上、WebUI 打不开这两个致命问题，并重制面板皮肤。
+
+### 修复
+
+- **插件无法安装（致命）**：报错 `Conflicting modules: pilmoji -> module 'emoji.unicode_codes' has no attribute 'get_emoji_unicode_dict'`。根因是 requirements 里 pin 的 `pilmoji==2.0.4` + `emoji==1.7.0` 与 AstrBot 4.27+ 运行时的 `emoji>=2` 不兼容，而 AstrBot 会在加载插件前真实 import 依赖做预检，冲突即拒绝加载整个插件。现已彻底移除这两个依赖，emoji 绘制改为自研实现，依赖只剩 `aiosqlite` / `apscheduler` / `aiohttp` / `pillow`。
+- **WebUI 报「未检测到 AstrBot 页面运行环境」**：面板脚本原来在首次执行时就快照 `window.AstrBotPluginPage`，而 AstrBot 注入 bridge SDK 的时机可能更晚，快照到 null 后所有请求都失败。改为惰性获取 + 最长 20 秒轮询等待，超时才显示带排查建议的诊断卡片。
+
+### 新增
+
+- **自研零依赖 emoji 渲染**（`features/album/emoji_text.py`）：按字符簇切分文本，普通文字与彩色 emoji 分别用对应字体绘制后拼接；彩色字体按「自定义路径 → 系统字体」查找，找不到时优雅降级。
+- 新增配置项 `fonts.custom_emoji_font_path`，可手动指定彩色 emoji 字体（例如自备 `NotoColorEmoji.ttf`）。
+- **WebUI 皮肤全面重制**：蓝紫渐变主题（与 logo 同色系）、极光背景、侧栏导航、毛玻璃顶栏、骨架屏、卡片式统计、自绘开关、窄屏胶囊导航，并尊重系统「减少动态效果」偏好。
+- 新增 3 个防漂移测试，校验页面 id、CSS 类名与 app.js 实际用到的保持一致，以及页面只引用相对路径资源。
+- README 增补「能上传原图吗」与「Emoji 渲染」两节，说明单图为原始字节直传、拼接长图会重编码，以及 ZWJ 组合与国旗字形的已知限制。
+
+### 其他
+
+- 测试总数 270 → 307。
+
 ## [v1.0.1] - 2026-08-31
 
 按 llbot 与 SnowLuma 的官方接口清单校正群相册适配。

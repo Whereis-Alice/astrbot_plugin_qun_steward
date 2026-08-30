@@ -20,6 +20,7 @@ from PIL import ImageFont
 
 from ...core.config import LOG_TAG, StewardConfig
 from ...core.utils import download_bytes
+from .emoji_text import SYSTEM_EMOJI_FONTS, EmojiFont
 
 #: 数据目录 / 系统目录里会去找的字体文件名
 _NOTO_NAMES = {
@@ -48,6 +49,15 @@ _SYSTEM_FONTS: dict[str, tuple[str, ...]] = {
 }
 
 
+#: 数据目录里会去找的彩色 emoji 字体文件名
+_EMOJI_NAMES: tuple[str, ...] = (
+    "seguiemj.ttf",
+    "NotoColorEmoji.ttf",
+    "AppleColorEmoji.ttf",
+    "OpenMoji-color-glyf_colr_0.ttf",
+)
+
+
 def _platform_key() -> str:
     if sys.platform.startswith("win"):
         return "win32"
@@ -63,6 +73,7 @@ class FontResolver:
         self.config = config
         self._cache: dict[tuple[int, bool], Any] = {}
         self._resolved: dict[bool, Path | None] = {}
+        self._emoji: EmojiFont | None = None
         self._warned = False
 
     # ------------------------------------------------------------------ 查找
@@ -108,10 +119,36 @@ class FontResolver:
         self._resolved[bold] = found
         return found
 
+    def resolve_emoji(self) -> Path | None:
+        """找一款彩色 emoji 字体：自定义路径 → 数据目录 → 系统自带。"""
+        candidates: list[Path] = []
+        custom = self.config.fonts.str("custom_emoji_font_path", "")
+        if custom:
+            candidates.append(Path(custom))
+        candidates.extend(self.config.font_dir / name for name in _EMOJI_NAMES)
+        candidates.extend(Path(p) for p in SYSTEM_EMOJI_FONTS)
+        for path in candidates:
+            try:
+                if path.is_file():
+                    return path
+            except OSError:
+                continue
+        return None
+
+    def emoji_font(self) -> EmojiFont:
+        """返回缓存的彩色 emoji 字体包装对象（找不到时 available 为 False）。"""
+        if self._emoji is None:
+            path = self.resolve_emoji()
+            if path is None:
+                logger.debug(f"{LOG_TAG} 未找到彩色 emoji 字体，emoji 将按正文字体绘制")
+            self._emoji = EmojiFont(path)
+        return self._emoji
+
     def invalidate(self) -> None:
         """字体文件变动（例如刚下载完）后清缓存。"""
         self._cache.clear()
         self._resolved.clear()
+        self._emoji = None
 
     # ------------------------------------------------------------------ 加载
 

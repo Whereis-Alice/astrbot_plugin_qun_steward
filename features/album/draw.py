@@ -2,12 +2,12 @@
 
 从上游 astrbot_plugin_qun_album 移植，保留原有排版参数，改为通过
 FontResolver 取字体、通过配置目录取气泡素材，不再依赖模块级全局状态。
+emoji 混排交给 emoji_text.TextPainter（零额外依赖，替掉了 pilmoji）。
 """
 
 from __future__ import annotations
 
 import io
-import re
 from pathlib import Path
 from typing import Any
 
@@ -15,45 +15,8 @@ from astrbot.api import logger
 from PIL import Image, ImageDraw
 
 from ...core.config import LOG_TAG
+from .emoji_text import TextPainter
 from .fonts import FontResolver
-
-# --------------------------------------------------------------------------- #
-# emoji 库兼容层：emoji>=2 移除了 1.x 的若干 API，而 pilmoji 2.0.4 仍在用。
-# 这里按需补齐，任何异常都直接忽略（最多退化成不渲染彩色 emoji）。
-# --------------------------------------------------------------------------- #
-try:  # pragma: no cover - 依赖第三方库版本
-    import emoji
-    from emoji import unicode_codes
-
-    if not hasattr(unicode_codes, "get_emoji_unicode_dict"):
-
-        def _get_emoji_unicode_dict(lang: str) -> dict[str, str]:
-            return {data[lang]: char for char, data in emoji.EMOJI_DATA.items() if lang in data}
-
-        unicode_codes.get_emoji_unicode_dict = _get_emoji_unicode_dict
-
-    if not hasattr(unicode_codes, "EMOJI_UNICODE"):
-        unicode_codes.EMOJI_UNICODE = {"en": unicode_codes.get_emoji_unicode_dict("en")}
-
-    if not hasattr(emoji, "get_emoji_regexp"):
-        _emoji_regexp: re.Pattern[str] | None = None
-
-        def _get_emoji_regexp() -> re.Pattern[str]:
-            global _emoji_regexp
-            if _emoji_regexp is None:
-                items = sorted(emoji.EMOJI_DATA.keys(), key=len, reverse=True)
-                _emoji_regexp = re.compile("|".join(re.escape(item) for item in items))
-            return _emoji_regexp
-
-        emoji.get_emoji_regexp = _get_emoji_regexp
-except Exception:  # noqa: BLE001
-    emoji = None  # type: ignore[assignment]
-
-try:  # pragma: no cover - 可选依赖
-    from pilmoji import Pilmoji
-except Exception:  # noqa: BLE001
-    Pilmoji = None  # type: ignore[assignment]
-
 
 #: 角色 -> 徽章底色
 ROLE_COLORS = {"owner": "#fdd93f", "admin": "#3fe3d8"}
@@ -87,38 +50,6 @@ def _text_size(font: Any, text: str) -> tuple[int, int]:
     return bbox[2] - bbox[0], bbox[3] - bbox[1]
 
 
-def wrap_text(text: str, font: Any, max_width: int) -> list[str]:
-    """按像素宽度逐字符换行；中日韩文本没有词边界，逐字符最稳。"""
-    lines: list[str] = []
-    for paragraph in text.replace("\r\n", "\n").split("\n"):
-        if not paragraph:
-            lines.append("")
-            continue
-        current = ""
-        for char in paragraph:
-            candidate = current + char
-            width, _ = _text_size(font, candidate)
-            if width <= max_width:
-                current = candidate
-            else:
-                lines.append(current)
-                current = char
-        if current:
-            lines.append(current)
-    return lines
-
-
-def pad_emojis(text: str) -> str:
-    """给 emoji 两侧补空格，避免 pilmoji 贴图压住相邻文字。"""
-    if emoji is None:
-        return text
-    try:
-        pattern = emoji.get_emoji_regexp()
-        return re.sub(pattern, lambda m: " " + m.group(0) + " ", text)
-    except Exception:  # noqa: BLE001
-        return text
-
-
 def make_italic(image: Image.Image, skew: float = 0.1) -> Image.Image:
     """错切变换模拟斜体。"""
     width, height = image.size
@@ -141,6 +72,7 @@ class MemeRenderer:
     def __init__(self, fonts: FontResolver, resource_dir: Path) -> None:
         self.fonts = fonts
         self.resource_dir = resource_dir
+        self.painter = TextPainter(fonts.emoji_font())
         self._corners: list[Image.Image] | None = None
         self._corner_missing = False
 
@@ -168,7 +100,7 @@ class MemeRenderer:
 
     def make_dialog_box(self, text: str, name_w: int = 0) -> Image.Image:
         font = self.fonts.load(BUBBLE_FONT_SIZE)
-        lines = wrap_text(pad_emojis(text), font, BUBBLE_MAX_TEXT_WIDTH)
+        lines = self.painter.wrap(text, font, BUBBLE_MAX_TEXT_WIDTH)
 
         line_spacing = 4
         ascent, descent = font.getmetrics()
@@ -177,8 +109,7 @@ class MemeRenderer:
         text_width = 0
         text_height = 0
         for line in lines:
-            width, _ = _text_size(font, line)
-            text_width = max(text_width, width)
+            text_width = max(text_width, self.painter.measure(line, font))
             text_height += line_height + line_spacing
         if lines:
             text_height -= line_spacing
@@ -203,7 +134,7 @@ class MemeRenderer:
 
         start_x = 65
         start_y = 17 + (box_h - 40 - text_height) // 2
-        self._draw_lines(box, draw, lines, font, (start_x, start_y), line_height + line_spacing, descent)
+        self._draw_lines(box, draw, lines, font, (start_x, start_y), line_height + line_spacing)
         return box
 
     def _draw_lines(
@@ -214,42 +145,19 @@ class MemeRenderer:
         font: Any,
         origin: tuple[int, int],
         step: int,
-        descent: int,
     ) -> None:
         x, y = origin
-        if Pilmoji is not None:
-            offset = (0, max(1, int(descent * 0.9)))
-            try:
-                with Pilmoji(canvas, emoji_position_offset=offset) as pilmoji:
-                    for line in lines:
-                        pilmoji.text((x, y), line, font=font, fill="black")
-                        y += step
-                return
-            except Exception as exc:  # noqa: BLE001 - emoji 源不可用时退回纯文本
-                logger.debug(f"{LOG_TAG} Pilmoji 渲染失败，退回纯文本: {exc}")
-                y = origin[1]
         for line in lines:
-            draw.text((x, y), line, font=font, fill="black")
+            self.painter.draw(canvas, draw, (x, y), line, font, "black")
             y += step
 
     def _draw_text_image(self, font: Any, text: str, fill: str) -> Image.Image:
         """把一段文字画到刚好裁切的透明图上（用于头衔标签）。"""
-        bbox = font.getbbox(text) or (0, 0, 0, 0)
-        width = bbox[2] - bbox[0]
-        height = bbox[3] - bbox[1]
-        image = Image.new("RGBA", (width + 20, height + 20), (0, 0, 0, 0))
-        position = (-bbox[0] + 10, -bbox[1] + 10)
-        drawn = False
-        if Pilmoji is not None:
-            try:
-                _, descent = font.getmetrics()
-                with Pilmoji(image, emoji_position_offset=(0, max(1, int(descent * 0.6)))) as pilmoji:
-                    pilmoji.text(position, text, font=font, fill=fill)
-                drawn = True
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"{LOG_TAG} Pilmoji 渲染头衔失败: {exc}")
-        if not drawn:
-            ImageDraw.Draw(image).text(position, text, font=font, fill=fill)
+        pad = 20
+        width = self.painter.measure(text, font)
+        ascent, descent = font.getmetrics()
+        image = Image.new("RGBA", (width + pad * 2, ascent + descent + pad * 2), (0, 0, 0, 0))
+        self.painter.draw(image, ImageDraw.Draw(image), (pad, pad), text, font, fill)
         cropped = image.getbbox()
         return image.crop(cropped) if cropped else image
 
@@ -350,7 +258,8 @@ class MemeRenderer:
         avatar.putalpha(mask)
 
         name_font = self.fonts.load(35)
-        name_w, name_h = _text_size(name_font, name)
+        name_w = self.painter.measure(name, name_font)
+        _, name_h = _text_size(name_font, name)
 
         badge = self._make_badge(role, title, level) if show_title else None
         box = self.make_dialog_box(text)
@@ -366,17 +275,7 @@ class MemeRenderer:
             canvas.paste(badge, (BADGE_X, 25), mask=badge)
 
         name_y = 20 + (35 - name_h) // 2
-        drawn = False
-        if Pilmoji is not None:
-            try:
-                _, descent = name_font.getmetrics()
-                with Pilmoji(canvas, emoji_position_offset=(0, max(1, int(descent * 0.6)))) as pilmoji:
-                    pilmoji.text((name_x, name_y), name, font=name_font, fill=NAME_COLOR)
-                drawn = True
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"{LOG_TAG} Pilmoji 渲染昵称失败: {exc}")
-        if not drawn:
-            ImageDraw.Draw(canvas).text((name_x, name_y), name, font=name_font, fill=NAME_COLOR)
+        self.painter.draw(canvas, ImageDraw.Draw(canvas), (name_x, name_y), name, name_font, NAME_COLOR)
 
         output = io.BytesIO()
         canvas.convert("RGB").save(output, format="JPEG", quality=90)

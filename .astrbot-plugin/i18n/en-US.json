@@ -32,6 +32,7 @@
     "time": "Time"
   },
   "common": {
+    "connecting": "Connecting to the AstrBot page runtime…",
     "done": "Updated",
     "empty": "No data",
     "group": "Group",
@@ -40,6 +41,7 @@
     "members": " members",
     "noChange": "Nothing to save",
     "noSdk": "AstrBot page runtime not detected",
+    "noSdkHint": "This page must be opened from the AstrBot dashboard, which injects the plugin page runtime. Opening index.html directly or having the page script blocked will cause this error.",
     "off": "Off",
     "on": "On",
     "onePerLine": "One item per line",
@@ -48,6 +50,7 @@
     "refresh": "Refresh",
     "reloadAll": "Reload data",
     "reloadGroups": "Re-fetch group list",
+    "reloadPage": "Reload page",
     "requestFailed": "The API returned an error",
     "retry": "Retry",
     "save": "Save changes",

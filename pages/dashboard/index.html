@@ -3,28 +3,55 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
     <title>群务管家</title>
     <link rel="stylesheet" href="./style.css" />
   </head>
   <body>
-    <div class="layout">
+    <!-- 外壳结构由 app.js 依赖：下列 id 不可随意改名 -->
+    <div class="app">
       <aside class="sidebar">
         <div class="brand">
-          <div class="brand-mark">群</div>
-          <div class="brand-text">
+          <span class="brand-mark" aria-hidden="true">
+            <svg viewBox="0 0 64 64" focusable="false">
+              <defs>
+                <linearGradient id="qsTile" x1="0" y1="0" x2="1" y2="1">
+                  <stop offset="0" stop-color="#5B8CFF" />
+                  <stop offset="1" stop-color="#7B5CFF" />
+                </linearGradient>
+              </defs>
+              <rect x="0" y="0" width="64" height="64" rx="16" fill="url(#qsTile)" />
+              <path d="M32 10 L50 15 V33 C50 43 42 50 32 54 C22 50 14 43 14 33 V15 Z" fill="#FBFCFF" />
+              <text x="32" y="35" text-anchor="middle" font-size="21" font-weight="700" fill="#3B5BDB"
+                    font-family="'Microsoft YaHei','PingFang SC','Noto Sans SC',sans-serif">群</text>
+              <circle cx="25" cy="43" r="2.4" fill="#8C9BD8" />
+              <circle cx="32" cy="43" r="2.4" fill="#8C9BD8" />
+              <circle cx="39" cy="43" r="2.4" fill="#8C9BD8" />
+            </svg>
+          </span>
+          <span class="brand-text">
             <span class="brand-title" id="brand-title">群务管家</span>
             <span class="brand-version" id="brand-version">加载中…</span>
-          </div>
+          </span>
         </div>
-        <nav class="nav" id="nav" aria-label="导航"></nav>
+        <nav class="nav" id="nav" aria-label="功能导航"></nav>
         <div class="sidebar-foot">
           <button class="btn small" id="btn-theme" type="button">切换深浅色</button>
-          <button class="btn small" id="btn-reload" type="button">刷新数据</button>
+          <button class="btn small" id="btn-reload" type="button">重新加载数据</button>
         </div>
       </aside>
-      <main class="main" id="main">
-        <div class="loading">正在连接插件接口…</div>
-      </main>
+      <div class="content">
+        <header class="topbar">
+          <div class="topbar-head">
+            <h1 id="page-title">总览</h1>
+            <p id="page-desc">正在准备…</p>
+          </div>
+          <div class="topbar-actions" id="page-actions"></div>
+        </header>
+        <main class="page" id="main">
+          <div class="loading">正在连接 AstrBot 页面环境…</div>
+        </main>
+      </div>
     </div>
     <div class="toast-host" id="toast-host" aria-live="polite"></div>
     <script src="./app.js"></script>
