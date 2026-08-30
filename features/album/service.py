@@ -25,6 +25,7 @@ from ...core.config import LOG_TAG
 from ...core.protocol import (
     album_name_of,
     backend_label,
+    create_album,
     detect_backend,
     find_album,
     list_albums,
@@ -367,6 +368,7 @@ class AlbumFeature(Feature):
 
         album_id = ""
         used_cache = False
+        created = False
         if album_name:
             cached = self._default_cache.get(group_id)
             if cached and cached.get("album_name") == album_name:
@@ -374,6 +376,11 @@ class AlbumFeature(Feature):
                 used_cache = bool(album_id)
             if not album_id:
                 album = await find_album(event, group_id, album_name)
+                if album is None and resolved_from_config:
+                    # 相册名是管理员在配置里写死的，协议端支持时直接建一个，
+                    # 免得每次换季新建相册都要手动去 QQ 里点一遍
+                    album = await create_album(event, group_id, album_name)
+                    created = album is not None
                 if album is None:
                     return f"相册【{album_name}】不存在，请先在群相册里创建，或检查名字是否写错。"
                 album_id = str(album.get("album_id") or "")
@@ -429,7 +436,8 @@ class AlbumFeature(Feature):
             detail=f"相册={album_name} 协议端={backend_label(backend)}",
         )
         suffix = "（已留档，可用关键词随机发图）" if keep_local else ""
-        return f"已上传到相册【{album_name}】{suffix}"
+        prefix = "已新建相册并上传到" if created else "已上传到相册"
+        return f"{prefix}【{album_name}】{suffix}"
 
     async def _build_image(self, event: AstrMessageEvent, count: int | None) -> bytes | None:
         """按参数决定图片来源：拼接长图 / 原图 / 单条文字渲染。"""

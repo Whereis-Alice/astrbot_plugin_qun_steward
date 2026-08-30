@@ -41,8 +41,23 @@
   - [LLOneBot / llbot](https://luckylillia.com/guide/introduction)
   - [SnowLuma](https://github.com/SnowLuma/SnowLuma)
 
-  插件启动后会探测一次协议端类型，相册等「非标准接口」会按识别结果选择调用方式；探测失败时按 NapCat 兼容路径降级，不影响群管功能。
-- **群相册**：需要协议端提供相册接口（NapCat 4.8.100+ 或等价实现）。若不支持，相册相关指令会给出明确提示，其余功能照常。
+  插件启动后会探测一次协议端类型（读 get_version_info 的 app_name），相册等「非标准接口」会按识别结果选择动作名与参数；探测失败时按 NapCat 兼容路径降级，不影响群管功能。
+
+### 群相册的协议端差异
+
+三家协议端都支持群相册，但动作名、参数名、返回字段都不一样，插件已逐一适配：
+
+| 协议端 | 列出相册 | 上传图片 | 新建相册 |
+| --- | --- | --- | --- |
+| NapCat | get_qun_album_list | upload_image_to_qun_album（file） | 不支持 |
+| LLOneBot / llbot | get_group_album_list | upload_group_album（files 数组，无 album_name） | create_group_album |
+| SnowLuma | get_qun_album_list | upload_image_to_qun_album（file + album_name） | 不支持 |
+
+- 返回字段命名不统一（llbot 是 album_id / name，SnowLuma 是 id / name），插件内部会抹平成同一结构。
+- 图片参数各端接受的形式不同（本地路径 / file:// / base64://），插件按该协议端最可能成功的顺序逐个尝试。
+- llbot 的上传接口**失败时也返回 status: ok**，真正结果藏在 fail_count / fail_indexes 里；插件会检查这两个字段，不会把失败报成成功。
+- 如果配置里写了默认相册名、群里却还没有这个相册，在支持新建的协议端（llbot）上会自动创建后再上传。
+- 协议端完全没有相册接口时，相册指令会给出明确提示，其余功能照常。
 
 ## 安装
 

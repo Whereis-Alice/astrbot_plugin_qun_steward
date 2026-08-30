@@ -2,6 +2,22 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v1.0.1] - 2026-08-31
+
+按 llbot 与 SnowLuma 的官方接口清单校正群相册适配。
+
+### 修复
+
+- **llbot 上传失败被当成成功**：llbot 的 upload_group_album 即使全部失败也返回 status: ok / retcode: 0，失败信息在 data.fail_count / fail_indexes 里。现在会检查这些字段，失败时改用下一种图片参数形式重试，全部失败才如实报错。
+- **llbot 图片参数顺序**：改为优先 file:// URI（官方示例形式），其次 base64，最后裸本地路径，少一次注定失败的往返。
+- **SnowLuma 相册列表动作**：改为优先调用 get_qun_album_list（与 NapCat 对齐的那个），失败再退回 get_group_album_list；单个动作缺失或返回失败时会自动尝试下一个。
+
+### 新增
+
+- 配置里指定的默认相册不存在时，在支持新建相册的协议端（llbot）上会自动创建后再上传，提示语会说明已新建。
+- README 增加「群相册的协议端差异」对照表，写明三端的动作名、参数差异与返回字段差异。
+- 协议适配新增 25 项测试（三端动作选择、失败判定、图片参数顺序、自动建相册），测试总数 270。
+
 ## [v1.0.0] - 2026-08-30
 
 首个正式版本。由 Zhalslar 的 astrbot_plugin_qqadmin（v3.4.0）与 astrbot_plugin_qun_album（v1.2.1）融合重写而来，指令名保持与上游一致，方便直接替换。
