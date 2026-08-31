@@ -524,7 +524,9 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.MEMBER, perm_key="album_upload")
     async def cmd_album_upload(self, event: AstrMessageEvent):
         """上传群相册 [相册名] [数量]：把图片或聊天记录长图存进群相册"""
-        yield event.plain_result(await self.album.upload(event))
+        # 成功时返回空串：QQ 客户端本身会显示相册卡片，不必再刷一条文字
+        if reply := await self.album.upload(event):
+            yield event.plain_result(reply)
 
     # ================================================================ 被动监听
 

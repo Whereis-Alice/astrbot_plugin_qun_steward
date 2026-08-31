@@ -335,7 +335,10 @@ class AlbumFeature(Feature):
     # ------------------------------------------------------------ 上传主流程
 
     async def upload(self, event: AstrMessageEvent) -> str:
-        """处理「上传群相册」指令，返回给用户的提示文本。"""
+        """处理「上传群相册」指令。
+
+        返回给用户的提示文本；返回空串表示无需回复（上传成功时 QQ 会自带卡片提示）。
+        """
         group_id = str(event.get_group_id())
         if not group_id:
             return "群相册只能在群里使用。"
@@ -435,9 +438,11 @@ class AlbumFeature(Feature):
             "album_upload",
             detail=f"相册={album_name} 协议端={backend_label(backend)}",
         )
-        suffix = "（已留档，可用关键词随机发图）" if keep_local else ""
-        prefix = "已新建相册并上传到" if created else "已上传到相册"
-        return f"{prefix}【{album_name}】{suffix}"
+        # 上传成功后 QQ 客户端自己会弹相册卡片，插件不再重复播报，返回空串即静默。
+        # 唯一例外是「相册是插件顺手新建的」，这件事客户端不会提示，值得说一句。
+        if created:
+            return f"已新建相册【{album_name}】并上传成功。"
+        return ""
 
     async def _build_image(self, event: AstrMessageEvent, count: int | None) -> bytes | None:
         """按参数决定图片来源：拼接长图 / 原图 / 单条文字渲染。"""

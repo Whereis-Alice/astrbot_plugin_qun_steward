@@ -13,7 +13,7 @@ help: |
   【插件自身】群管配置 / 群管重置 / 操作日志 / 撤销 / 群务帮助
 
   提示：绝大多数开关都能「按群覆写」，没写覆写的群自动跟随全局默认配置；危险操作（踢人、拉黑、清理群友）留有「撤销」窗口。
-version: v1.0.2
+version: v1.0.3
 author: Whereis-Alice
 repo: https://github.com/Whereis-Alice/astrbot_plugin_qun_steward
 support_platforms:
