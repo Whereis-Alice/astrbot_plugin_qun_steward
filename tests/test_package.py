@@ -130,6 +130,8 @@ class TestConfSchema:
             "audit",
             "album",
             "fonts",
+            "output",
+            "voice",
             "llm_get_msg_count",
             "enable_llm_tools",
             "perms",
@@ -141,7 +143,17 @@ class TestConfSchema:
             assert schema[key].get("description"), f"{key} 缺少说明"
 
     def test_sections_are_objects(self, schema: dict[str, Any]) -> None:
-        for key in ("default", "perms", "vote_ban", "safety", "audit", "album", "fonts"):
+        for key in (
+            "default",
+            "perms",
+            "vote_ban",
+            "safety",
+            "audit",
+            "album",
+            "fonts",
+            "output",
+            "voice",
+        ):
             assert schema[key]["type"] == "object"
             assert schema[key].get("items"), f"{key} 分区为空"
 

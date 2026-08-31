@@ -17,6 +17,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..core.config import LOG_TAG
+from ..core.protocol import call_action, unwrap
 from ..core.utils import (
     apply_delta,
     format_datetime,
@@ -34,6 +35,16 @@ from .base import Feature, rest_of
 MAX_PENDING_SHOWN = 20
 #: 待办超过这个秒数就不再参与「只有一条时自动选中」，避免误批陈旧申请
 STALE_SECONDS = 7 * 86400
+
+#: 协议端的待审进群列表（NapCat / llbot / SnowLuma 命名不一，依次尝试）
+_SYSTEM_MSG_ACTIONS: tuple[str, ...] = ("get_group_system_msg",)
+#: 被忽略/未处理的加群通知，作为上面的兜底数据源
+_IGNORED_ACTIONS: tuple[str, ...] = (
+    "get_group_ignored_notifies",
+    "get_group_ignore_add_request",
+)
+#: 一次对账最多拉多少条
+SYNC_LIMIT = 50
 
 
 class JoinFeature(Feature):
@@ -319,6 +330,72 @@ class JoinFeature(Feature):
             )
         return [dict(row) for row in rows]
 
+    # --------------------------------------------------- 与协议端对账 --- #
+    async def _remote_pending(
+        self, event: AstrMessageEvent, group_id: str
+    ) -> tuple[list[dict[str, Any]], str]:
+        """拉协议端的待审进群列表，返回（归一化后的条目, 错误提示）。
+
+        首选 get_group_system_msg；协议端没有这个动作时退回「被忽略的加群通知」，
+        两者结构基本一致，字段名做了兼容。
+        """
+        result = await call_action(
+            event,
+            _SYSTEM_MSG_ACTIONS,
+            group_id=int(group_id) if group_id else None,
+            only_pending=True,
+            count=SYNC_LIMIT,
+        )
+        if not result.ok:
+            result = await call_action(event, _IGNORED_ACTIONS)
+        if not result.ok:
+            return [], result.error or "协议端不支持查询待审进群列表"
+        items = _normalize_requests(result.data)
+        if group_id:
+            items = [item for item in items if item["group_id"] in ("", group_id)]
+        return items, ""
+
+    async def sync_pending(
+        self, event: AstrMessageEvent, group_id: str = ""
+    ) -> tuple[int, int, str]:
+        """把协议端的待审列表和插件待办对账，返回（新增, 关闭, 错误）。
+
+        两种情况会漏账：机器人离线期间进的申请没进过库；申请被别的管理员在手机上
+        处理掉了但库里还是 pending。对账后「待审进群」才是真实的。
+        """
+        gid = str(group_id or event.get_group_id() or "")
+        remote, error = await self._remote_pending(event, gid)
+        if error:
+            return 0, 0, error
+
+        remote_flags = {item["flag"] for item in remote if item["flag"]}
+        local = await self.pending(gid or None)
+        local_flags = {str(row["flag"]) for row in local}
+
+        added = 0
+        for item in remote:
+            if not item["flag"] or item["flag"] in local_flags:
+                continue
+            await self._save_request(
+                group_id=item["group_id"] or gid,
+                user_id=item["user_id"],
+                flag=item["flag"],
+                nickname=item["nickname"],
+                comment=item["comment"],
+                level=None,
+            )
+            added += 1
+
+        closed = 0
+        for row in local:
+            if str(row["flag"]) not in remote_flags:
+                await self._mark_handled(str(row["flag"]), "expired", "协议端对账")
+                closed += 1
+
+        if added or closed:
+            logger.info(f"{LOG_TAG} 进群待办对账 group={gid} 新增={added} 关闭={closed}")
+        return added, closed, ""
+
     def _format_pending(self, items: list[dict[str, Any]]) -> str:
         lines = [f"待审进群申请（共 {len(items)} 条）"]
         for item in items[:MAX_PENDING_SHOWN]:
@@ -336,10 +413,24 @@ class JoinFeature(Feature):
         return "\n".join(lines)
 
     async def list_pending(self, event: AstrMessageEvent) -> str:
-        items = await self.pending(event.get_group_id())
+        """「待审进群」：先和协议端对账，再列出真实的待办。"""
+        group_id = event.get_group_id()
+        added, closed, error = await self.sync_pending(event, group_id)
+        items = await self.pending(group_id)
+        notes: list[str] = []
+        if added:
+            notes.append(f"补录 {added} 条离线期间的申请")
+        if closed:
+            notes.append(f"清掉 {closed} 条已在客户端处理过的")
         if not items:
-            return "当前没有待审的进群申请"
-        return self._format_pending(items)
+            tail = "（" + "，".join(notes) + "）" if notes else ""
+            return f"当前没有待审的进群申请{tail}"
+        text = self._format_pending(items)
+        if notes:
+            text += "\n对账：" + "，".join(notes)
+        elif error:
+            text += "\n提示：当前协议端不支持待审列表对账，列表可能不含离线期间的申请"
+        return text
 
     # ------------------------------------------------------------ 审批 --- #
     def _flag_from_reply(self, event: AstrMessageEvent) -> str:
@@ -370,6 +461,26 @@ class JoinFeature(Feature):
             return items[0], tokens, ""
         return None, tokens, self._format_pending(items)
 
+    async def _send_approval(
+        self, event: AstrMessageEvent, flag: str, agree: bool, reason: str
+    ) -> None:
+        """同意/拒绝一条申请。
+
+        主动申请是 sub_type=add，别人邀请进群是 sub_type=invite。上游只发 add，
+        导致邀请类申请永远处理失败，这里在 add 失败后再按 invite 试一次。
+        """
+        last: Exception | None = None
+        for sub_type in ("add", "invite"):
+            try:
+                await event.bot.set_group_add_request(
+                    flag=flag, sub_type=sub_type, approve=agree, reason=reason
+                )
+                return
+            except Exception as exc:  # noqa: BLE001 - 换另一种 sub_type 再试
+                last = exc
+                logger.debug(f"{LOG_TAG} 审批失败 flag={flag} sub_type={sub_type}: {exc}")
+        raise last if last else RuntimeError("处理进群申请失败")
+
     async def handle_approval(
         self, event: AstrMessageEvent, agree: bool, extra: str = ""
     ) -> str:
@@ -393,15 +504,13 @@ class JoinFeature(Feature):
         nickname = str(record["nickname"]) if record else "该用户"
         target_id = str(record["user_id"]) if record else ""
         try:
-            await event.bot.set_group_add_request(
-                flag=flag, sub_type="add", approve=agree, reason=reason
-            )
+            await self._send_approval(event, flag, agree, reason)
         except Exception as exc:  # noqa: BLE001
             logger.error(f"{LOG_TAG} 处理进群申请失败 flag={flag}: {exc}")
             await self._mark_handled(flag, "expired", event.get_sender_id())
             await self.log(
                 event,
-                "approve" if agree else "reject",
+                "join_approve" if agree else "join_reject",
                 target_id=target_id,
                 detail=str(exc),
                 success=False,
@@ -413,7 +522,7 @@ class JoinFeature(Feature):
         )
         await self.log(
             event,
-            "approve" if agree else "reject",
+            "join_approve" if agree else "join_reject",
             target_id=target_id,
             detail=reason or ("同意" if agree else "拒绝"),
         )
@@ -536,7 +645,7 @@ class JoinFeature(Feature):
             await self._mark_handled(flag, "approved" if approve else "rejected", "auto")
             await self.audit.record(
                 group_id=group_id,
-                action="approve" if approve else "reject",
+                action="join_approve" if approve else "join_reject",
                 operator_id="auto",
                 operator_name="自动审核",
                 target_id=user_id,
@@ -576,3 +685,62 @@ class JoinFeature(Feature):
                 (cutoff,),
             )
         return removed
+
+
+def _normalize_requests(payload: Any) -> list[dict[str, Any]]:
+    """把各协议端的待审进群响应统一成 [{flag, group_id, user_id, nickname, comment}]。
+
+    NapCat 返回 {"join_requests": [...], "InvitedRequest": [...]}，llbot / SnowLuma
+    直接返回数组，字段名有 requester_uin / requester_nick / message 等多种写法。
+    已经处理过（checked=true）的条目会被丢掉。
+    """
+    raw = unwrap(payload)
+    entries: list[Any] = []
+    if isinstance(raw, list):
+        entries = raw
+    elif isinstance(raw, dict):
+        for value in raw.values():
+            if isinstance(value, list):
+                entries.extend(value)
+
+    items: list[dict[str, Any]] = []
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("checked"):
+            continue
+        flag = str(
+            entry.get("flag")
+            or entry.get("request_id")
+            or entry.get("requestId")
+            or entry.get("seq")
+            or ""
+        ).strip()
+        user_id = str(
+            entry.get("requester_uin")
+            or entry.get("user_id")
+            or entry.get("requesterUin")
+            or entry.get("uin")
+            or ""
+        ).strip()
+        if not flag or not user_id:
+            continue
+        nickname = str(
+            entry.get("requester_nick")
+            or entry.get("nickname")
+            or entry.get("requesterNick")
+            or ""
+        ).strip()
+        comment = str(entry.get("message") or entry.get("comment") or "").strip()
+        invitor = str(entry.get("invitor_uin") or entry.get("invitorUin") or "").strip()
+        if invitor and invitor != "0":
+            invitor_nick = str(entry.get("invitor_nick") or "").strip() or invitor
+            comment = f"由 {invitor_nick} 邀请入群" + (f"｜{comment}" if comment else "")
+        items.append(
+            {
+                "flag": flag,
+                "group_id": str(entry.get("group_id") or entry.get("groupId") or "").strip(),
+                "user_id": user_id,
+                "nickname": nickname or user_id,
+                "comment": comment,
+            }
+        )
+    return items

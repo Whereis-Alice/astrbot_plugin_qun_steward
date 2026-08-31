@@ -26,6 +26,8 @@ SETTING_SECTIONS: dict[str, str] = {
     "audit": "操作审计",
     "album": "群相册",
     "fonts": "字体",
+    "output": "长列表输出",
+    "voice": "AI 声聊",
 }
 
 #: 顶层标量配置（键 -> 中文标题）

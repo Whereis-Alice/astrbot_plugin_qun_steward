@@ -124,7 +124,10 @@ class StewardConfig:
 
     @property
     def vote_ban(self) -> Section:
-        return Section(self._raw.get("vote_ban"), {"ttl": 120, "threshold": 3, "allow_self_vote": False})
+        return Section(
+            self._raw.get("vote_ban"),
+            {"ttl": 120, "threshold": 3, "allow_self_vote": False, "mode": "两者都行"},
+        )
 
     @property
     def safety(self) -> Section:
@@ -153,7 +156,24 @@ class StewardConfig:
                 "level_threshold": 0,
                 "show_title": True,
                 "max_stitch_count": 20,
+                "cloud_random": True,
             },
+        )
+
+    @property
+    def output(self) -> Section:
+        """长列表输出方式（合并转发 / 长图 / 纯文本）。"""
+        return Section(
+            self._raw.get("output"),
+            {"long_list_mode": "合并转发", "node_lines": 15},
+        )
+
+    @property
+    def voice(self) -> Section:
+        """AI 声聊设置。"""
+        return Section(
+            self._raw.get("voice"),
+            {"default_character": "", "chat_type": 1},
         )
 
     @property

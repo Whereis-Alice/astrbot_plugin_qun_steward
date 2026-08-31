@@ -79,7 +79,7 @@ class MemberFeature(Feature):
 
         url = await self.to_image("\n".join(lines))
         await event.send(event.image_result(url))
-        await self.log(event, "get_group_member_list", detail=f"{len(members)} 人")
+        await self.log(event, "member_list", detail=f"{len(members)} 人")
 
     # ------------------------------------------------------------ 清理群友 --- #
     def _collect_candidates(
@@ -231,7 +231,7 @@ class MemberFeature(Feature):
             success += 1
         await self.log(
             event,
-            "clear_group_member",
+            "clear_member",
             detail=f"成功 {success} 人，失败 {len(failed)} 人",
             success=not failed,
         )

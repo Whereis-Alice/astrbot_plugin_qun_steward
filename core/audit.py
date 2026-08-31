@@ -13,6 +13,7 @@ from astrbot.api import logger
 
 from .config import LOG_TAG, StewardConfig
 from .db import Database
+from .store import FIELD_LABELS
 
 #: 动作标识 -> 中文名，用于展示
 ACTION_LABELS: dict[str, str] = {
@@ -39,6 +40,7 @@ ACTION_LABELS: dict[str, str] = {
     "join_approve": "同意进群",
     "join_reject": "拒绝进群",
     "clear_member": "清理群成员",
+    "member_list": "导出群成员",
     "file_upload": "上传群文件",
     "file_delete": "删除群文件",
     "album_upload": "上传群相册",
@@ -46,11 +48,27 @@ ACTION_LABELS: dict[str, str] = {
     "spamming_ban": "刷屏处置",
     "vote_ban": "投票禁言",
     "undo": "撤销操作",
+    "notice_del": "删除群公告",
+    "at_all": "@全体成员",
+    "file_move": "移动群文件",
+    "file_rename": "重命名群文件",
+    "file_tidy": "整理群文件",
+    "album_delete": "删除相册图片",
+    "voice": "AI 声聊",
+    "set_config": "修改群配置",
+    "reset_config": "重置群配置",
 }
 
 
 def action_label(action: str) -> str:
-    return ACTION_LABELS.get(action, action)
+    """动作标识 -> 中文名。
+
+    有些调用点直接把群配置字段名当动作名传进来（例如进群审核相关开关），
+    所以命中不到 ACTION_LABELS 时再回退查一次群配置字段表，避免展示原始英文。
+    """
+    if action in ACTION_LABELS:
+        return ACTION_LABELS[action]
+    return FIELD_LABELS.get(action, action)
 
 
 class AuditLog:

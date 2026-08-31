@@ -50,7 +50,14 @@ GROUP_DEFAULTS: dict[str, Any] = {
 }
 
 _DEFAULT_SECTIONS: dict[str, dict[str, Any]] = {
-    "vote_ban": {"ttl": 120, "threshold": 3, "allow_self_vote": False},
+    "vote_ban": {
+        "ttl": 120,
+        "threshold": 3,
+        "allow_self_vote": False,
+        "mode": "两者都行",
+        "agree_emoji": "76",
+        "disagree_emoji": "77",
+    },
     "safety": {
         "batch_interval": 0.4,
         "max_batch_kick": 50,
@@ -58,8 +65,15 @@ _DEFAULT_SECTIONS: dict[str, dict[str, Any]] = {
         "undo_window": 900,
     },
     "audit": {"enable": True, "retain_days": 30},
-    "album": {"level_threshold": 0, "show_title": True, "max_stitch_count": 20},
+    "album": {
+        "level_threshold": 0,
+        "show_title": True,
+        "max_stitch_count": 20,
+        "cloud_random": True,
+    },
     "fonts": {"auto_download": False},
+    "output": {"long_list_mode": "合并转发", "node_lines": 15},
+    "voice": {"default_character": "", "chat_type": 1},
 }
 
 
@@ -109,6 +123,14 @@ class FakeConfig:
     @property
     def fonts(self) -> Section:
         return self._section("fonts")
+
+    @property
+    def output(self) -> Section:
+        return self._section("output")
+
+    @property
+    def voice(self) -> Section:
+        return self._section("voice")
 
     @property
     def group_defaults(self) -> dict[str, Any]:

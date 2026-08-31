@@ -24,21 +24,24 @@ from .core.audit import AuditLog
 from .core.config import LOG_TAG, StewardConfig
 from .core.db import Database
 from .core.group_cache import GroupInfoCache
+from .core.messaging import send_forward, split_text
 from .core.permission import PermissionResolver, PermLevel, perm_required
 from .core.store import GroupStore
 from .core.undo import UndoStack
 from .core.utils import parse_bool
-from .features.album import AlbumFeature
+from .features.album import AlbumFeature, PickedImage
 from .features.base import FeatureContext, args_of, rest_of
 from .features.config_cmd import ConfigFeature
 from .features.curfew import CurfewFeature
 from .features.essence import EssenceFeature
 from .features.files import FilesFeature
+from .features.insight import InsightFeature
 from .features.join import JoinFeature
 from .features.member import MemberFeature
 from .features.moderation import ModerationFeature
 from .features.notice import NoticeFeature
 from .features.recall import RecallFeature
+from .features.voice import VoiceFeature
 from .features.vote import VoteFeature
 from .features.words import WordFeature
 from .web import StewardWebController
@@ -104,6 +107,8 @@ class QunStewardPlugin(Star):
         self.join = JoinFeature(feature_ctx)
         self.member = MemberFeature(feature_ctx)
         self.files = FilesFeature(feature_ctx)
+        self.insight = InsightFeature(feature_ctx)
+        self.voice = VoiceFeature(feature_ctx)
         self.album = AlbumFeature(feature_ctx)
         self.configs = ConfigFeature(feature_ctx)
 
@@ -174,6 +179,29 @@ class QunStewardPlugin(Star):
             logger.warning(f"{LOG_TAG} 文本转图片失败，回退纯文本：{exc}")
             return event.plain_result(text)
 
+    async def _long(self, event: AstrMessageEvent, text: str) -> Any:
+        """天生很长的列表：按配置走合并转发 / 长图 / 纯文本。
+
+        合并转发的好处是不刷屏、还能复制文字；协议端不支持时自动回退成长图。
+        """
+        if not text:
+            return None
+        mode = self.cfg.output.str("long_list_mode", "合并转发")
+        if mode == "纯文本":
+            return event.plain_result(text)
+        if mode == "合并转发" and event.get_group_id():
+            blocks = split_text(text, self.cfg.output.int("node_lines", 15))
+            if len(blocks) > 1 and await send_forward(event, blocks):
+                return None
+        return await self._rich(event, text)
+
+    @staticmethod
+    def _image(picked: PickedImage) -> Comp.Image:
+        """随机图既可能是本地留档文件，也可能是云端相册直链。"""
+        if picked.path is not None:
+            return Comp.Image.fromFileSystem(str(picked.path))
+        return Comp.Image.fromURL(picked.url)
+
     # ================================================================ 插件自身
 
     @filter.command("群务帮助", alias={"群管帮助"})
@@ -198,7 +226,7 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.MEMBER, perm_key="audit_view")
     async def cmd_audit(self, event: AstrMessageEvent):
         """操作日志 [关键词] [条数]"""
-        result = await self._rich(event, await self.configs.show_audit(event))
+        result = await self._long(event, await self.configs.show_audit(event))
         if result:
             yield result
 
@@ -235,7 +263,8 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.ADMIN, perm_key="vote")
     async def cmd_vote_start(self, event: AstrMessageEvent):
         """投票禁言 <秒数> @某人：发起投票"""
-        yield event.plain_result(await self.vote.start(event, ban_time=_optional(event)))
+        if reply := await self.vote.start(event, ban_time=_optional(event)):
+            yield event.plain_result(reply)
 
     @filter.command("赞同禁言", alias={"同意禁言"})
     @perm_required(PermLevel.ADMIN, perm_key="vote")
@@ -352,7 +381,7 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.ADMIN, perm_key="get_essence_msg_list")
     async def cmd_essence_list(self, event: AstrMessageEvent):
         """群精华：查看精华消息列表"""
-        result = await self._rich(event, await self.essence.list_essence(event))
+        result = await self._long(event, await self.essence.list_essence(event))
         if result:
             yield result
 
@@ -360,7 +389,9 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.ADMIN, perm_key="word_ban")
     async def cmd_set_words(self, event: AstrMessageEvent):
         """设置禁词 +词 -词：带正负号增删，不带则整表覆写，留空查看"""
-        yield event.plain_result(await self.words.manage_words(event))
+        result = await self._long(event, await self.words.manage_words(event))
+        if result:
+            yield result
 
     @filter.command("内置禁词")
     @perm_required(PermLevel.ADMIN, perm_key="word_ban")
@@ -394,6 +425,12 @@ class QunStewardPlugin(Star):
         """设置群头像：指令带图或引用一张图片"""
         yield event.plain_result(await self.moderation.set_portrait(event))
 
+    @filter.command("全体成员", alias={"艾特全体", "@全体"})
+    @perm_required(PermLevel.ADMIN, perm_key="at_all")
+    async def cmd_at_all(self, event: AstrMessageEvent):
+        """全体成员 <内容>：发一条 @全体成员 通知，次数用完会提前拦下"""
+        yield event.plain_result(await self.moderation.at_all(event, rest_of(event)))
+
     @filter.command("发布群公告")
     @perm_required(PermLevel.ADMIN, perm_key="send_group_notice")
     async def cmd_publish_notice(self, event: AstrMessageEvent):
@@ -404,9 +441,15 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.MEMBER, perm_key="get_group_notice")
     async def cmd_view_notice(self, event: AstrMessageEvent):
         """群公告：查看已发布的群公告"""
-        result = await self._rich(event, await self.notice.view(event))
+        result = await self._long(event, await self.notice.view(event))
         if result:
             yield result
+
+    @filter.command("删除群公告", alias={"撤下群公告"})
+    @perm_required(PermLevel.ADMIN, perm_key="del_group_notice")
+    async def cmd_delete_notice(self, event: AstrMessageEvent):
+        """删除群公告 <序号>：序号见「群公告」"""
+        yield event.plain_result(await self.notice.delete(event, _arg(event)))
 
     # ================================================================ 进群退群
 
@@ -456,7 +499,7 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.ADMIN, perm_key="approve")
     async def cmd_join_pending(self, event: AstrMessageEvent):
         """待审进群：列出待处理的进群申请及序号"""
-        result = await self._rich(event, await self.join.list_pending(event))
+        result = await self._long(event, await self.join.list_pending(event))
         if result:
             yield result
 
@@ -502,7 +545,7 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.MEMBER, perm_key="view_group_file")
     async def cmd_view_file(self, event: AstrMessageEvent):
         """查看群文件 [文件夹/序号] [文件/序号]"""
-        result = await self._rich(event, await self.files.view(event, rest_of(event)))
+        result = await self._long(event, await self.files.view(event, rest_of(event)))
         if result:
             yield result
 
@@ -518,6 +561,38 @@ class QunStewardPlugin(Star):
         """删除群文件 <文件夹名/文件名>"""
         yield event.plain_result(await self.files.delete(event, rest_of(event)))
 
+    @filter.command("群文件直链", alias={"群文件链接"})
+    @perm_required(PermLevel.MEMBER, perm_key="view_group_file")
+    async def cmd_file_link(self, event: AstrMessageEvent):
+        """群文件直链 <文件夹名/文件名>：拿到下载地址"""
+        yield event.plain_result(await self.files.link(event, rest_of(event)))
+
+    @filter.command("群文件容量", alias={"群文件统计"})
+    @perm_required(PermLevel.MEMBER, perm_key="view_group_file")
+    async def cmd_file_usage(self, event: AstrMessageEvent):
+        """群文件容量：已用空间、文件数与上限"""
+        yield await self._rich(event, await self.files.usage(event))
+
+    @filter.command("移动群文件")
+    @perm_required(PermLevel.ADMIN, perm_key="manage_group_file")
+    async def cmd_file_move(self, event: AstrMessageEvent):
+        """移动群文件 <文件夹名/文件名> <目标文件夹名|根目录>"""
+        yield event.plain_result(await self.files.move(event, rest_of(event)))
+
+    @filter.command("重命名群文件", alias={"群文件改名"})
+    @perm_required(PermLevel.ADMIN, perm_key="manage_group_file")
+    async def cmd_file_rename(self, event: AstrMessageEvent):
+        """重命名群文件 <文件夹名/文件名> <新文件名>"""
+        yield event.plain_result(await self.files.rename(event, rest_of(event)))
+
+    @filter.command("整理群文件", alias={"清理群文件"})
+    @perm_required(PermLevel.ADMIN, perm_key="manage_group_file")
+    async def cmd_file_tidy(self, event: AstrMessageEvent):
+        """整理群文件 [散落|过期|N天|N MB] [确认]：先预览再确认删除"""
+        result = await self._long(event, await self.files.tidy(event, rest_of(event)))
+        if result:
+            yield result
+
     # ================================================================ 群相册
 
     @filter.command("上传群相册", alias={"up"})
@@ -527,6 +602,79 @@ class QunStewardPlugin(Star):
         # 成功时返回空串：QQ 客户端本身会显示相册卡片，不必再刷一条文字
         if reply := await self.album.upload(event):
             yield event.plain_result(reply)
+
+    @filter.command("查看群相册", alias={"群相册"})
+    @perm_required(PermLevel.MEMBER, perm_key="album_view")
+    async def cmd_album_browse(self, event: AstrMessageEvent):
+        """查看群相册 [相册名]：不带相册名列出全部相册，带上则列出相册里的图"""
+        result = await self._long(event, await self.album.browse(event, rest_of(event)))
+        if result:
+            yield result
+
+    @filter.command("随机图", alias={"来张图"})
+    @perm_required(PermLevel.MEMBER, perm_key="album_view")
+    async def cmd_album_random(self, event: AstrMessageEvent):
+        """随机图 <相册名>：从群相册里随机发一张"""
+        picked, note = await self.album.random_command(event, rest_of(event))
+        if picked is not None:
+            yield event.chain_result([self._image(picked)])
+            return
+        yield event.plain_result(note)
+
+    @filter.command("删相册图", alias={"删除相册图"})
+    @perm_required(PermLevel.ADMIN, perm_key="album_delete")
+    async def cmd_album_delete(self, event: AstrMessageEvent):
+        """删相册图 [相册名] <序号>：序号来自「查看群相册 <相册名>」"""
+        reply, detail = await self.album.remove_media(event, rest_of(event))
+        if detail:
+            await self.album.log(
+                event, "album_delete", detail=detail, success="失败=" not in detail
+            )
+        yield event.plain_result(reply)
+
+    # ================================================================ 群情报
+
+    @filter.command("群信息", alias={"群资料"})
+    @perm_required(PermLevel.MEMBER, perm_key="group_info")
+    async def cmd_group_info(self, event: AstrMessageEvent):
+        """群信息：群等级、人数、加群方式、当前管理策略"""
+        result = await self._long(event, await self.insight.group_info(event))
+        if result:
+            yield result
+
+    @filter.command("群荣誉", alias={"群榜单", "龙王"})
+    @perm_required(PermLevel.MEMBER, perm_key="group_honor")
+    async def cmd_group_honor(self, event: AstrMessageEvent):
+        """群荣誉：龙王、群聊之火、氛围担当等榜单"""
+        result = await self._long(event, await self.insight.honor(event))
+        if result:
+            yield result
+
+    @filter.command("禁言列表", alias={"查看禁言"})
+    @perm_required(PermLevel.MEMBER, perm_key="shut_list")
+    async def cmd_shut_list(self, event: AstrMessageEvent):
+        """禁言列表：当前正在被禁言的成员及剩余时间"""
+        result = await self._long(event, await self.insight.shut_list(event))
+        if result:
+            yield result
+
+    # ================================================================ AI 声聊
+
+    @filter.command("声聊", alias={"念台词"})
+    @perm_required(PermLevel.MEMBER, perm_key="voice")
+    async def cmd_voice_speak(self, event: AstrMessageEvent):
+        """声聊 [序号或音色名] <台词>：用 QQ 官方音色把台词念出来"""
+        # 成功时返回空串：语音消息本身就是回复
+        if reply := await self.voice.speak(event, rest_of(event)):
+            yield event.plain_result(reply)
+
+    @filter.command("声聊音色", alias={"音色列表"})
+    @perm_required(PermLevel.MEMBER, perm_key="voice")
+    async def cmd_voice_characters(self, event: AstrMessageEvent):
+        """声聊音色：列出本群可用的 AI 音色"""
+        result = await self._long(event, await self.voice.list_characters(event))
+        if result:
+            yield result
 
     # ================================================================ 被动监听
 
@@ -555,8 +703,8 @@ class QunStewardPlugin(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_album_keyword(self, event: AstrMessageEvent):
         """关键词随机图：命中相册名时随机发一张留档图片"""
-        if path := await self.album.random_keyword(event):
-            yield event.chain_result([Comp.Image.fromFileSystem(str(path))])
+        if picked := await self.album.random_keyword(event):
+            yield event.chain_result([self._image(picked)])
 
     # ================================================================ LLM 工具
     #

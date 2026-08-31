@@ -9,8 +9,18 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..core.config import LOG_TAG
+from ..core.protocol import as_dict, call_action
 from ..core.utils import extract_image_url, format_duration, get_nickname
-from .base import Feature, resolve_targets
+from .base import Feature, resolve_targets, rest_of
+
+#: 批量踢人（一次请求踢多人），协议端不支持时回退成逐个踢
+_KICK_BATCH_ACTIONS: tuple[str, ...] = ("set_group_kick_members",)
+
+#: 查询 @全体成员 的剩余次数
+_AT_ALL_REMAIN_ACTIONS: tuple[str, ...] = ("get_group_at_all_remain",)
+
+#: 发送群消息
+_SEND_GROUP_ACTIONS: tuple[str, ...] = ("send_group_msg",)
 
 
 class ModerationFeature(Feature):
@@ -224,6 +234,14 @@ class ModerationFeature(Feature):
             truncated = True
 
         action = "block" if reject else "kick"
+        # 多人时优先用协议端的批量接口，只发一次请求，风控概率更低
+        if len(targets) > 1 and (
+            batched := await self._kick_batch(event, group_id, targets, reject, action)
+        ):
+            if truncated:
+                batched += f"\n（一次最多操作 {max_batch} 人，其余已忽略）"
+            return batched
+
         results: list[str] = []
         for index, tid in enumerate(targets):
             await self._throttle(index)
@@ -245,6 +263,80 @@ class ModerationFeature(Feature):
         if truncated:
             results.append(f"（一次最多操作 {max_batch} 人，其余已忽略）")
         return "\n".join(results)
+
+    async def _kick_batch(
+        self,
+        event: AstrMessageEvent,
+        group_id: Any,
+        targets: list[str],
+        reject: bool,
+        action: str,
+    ) -> str:
+        """尝试批量踢人接口；协议端不支持或调用失败时返回空串，交由调用方逐个踢。"""
+        try:
+            user_ids = [int(tid) for tid in targets]
+        except (TypeError, ValueError):
+            return ""
+
+        result = await call_action(
+            event,
+            _KICK_BATCH_ACTIONS,
+            group_id=int(group_id),
+            user_id=user_ids,
+            reject_add_request=reject,
+        )
+        if not result.ok:
+            logger.debug(f"{LOG_TAG} 批量踢人不可用，回退逐个处理：{result.error}")
+            return ""
+
+        for tid in targets:
+            await self.log(event, action, target_id=tid, detail="批量操作")
+        verb = "踢出本群并拉黑" if reject else "踢出本群"
+        return f"已将 {len(targets)} 人{verb}：" + "、".join(targets)
+
+    # ------------------------------------------------------------ 全体成员 --- #
+    async def at_all(self, event: AstrMessageEvent, message: str = "") -> str:
+        """发一条 @全体成员 通知。
+
+        发之前先查剩余次数：次数用完时 QQ 会把它降级成普通消息，一条重要通知就
+        这么被淹掉了，这里直接拦下来并告知原因。
+        """
+        group_id = event.get_group_id()
+        if not group_id:
+            return "请在群里使用该指令"
+        text = str(message or rest_of(event)).strip()
+        if not text:
+            return "未指定要通知的内容"
+
+        remain = as_dict(
+            (await call_action(event, _AT_ALL_REMAIN_ACTIONS, group_id=int(group_id))).data
+        )
+        group_left = remain.get("remain_at_all_count_for_group")
+        self_left = remain.get("remain_at_all_count_for_uin")
+        if remain.get("can_at_all") is False:
+            return "当前账号无法 @全体成员（通常是没有管理员权限）"
+        if isinstance(group_left, int) and group_left <= 0:
+            return "本群今日的 @全体成员次数已用完，明天再试"
+        if isinstance(self_left, int) and self_left <= 0:
+            return "本账号今日的 @全体成员次数已用完，明天再试"
+
+        result = await call_action(
+            event,
+            _SEND_GROUP_ACTIONS,
+            group_id=int(group_id),
+            message=[
+                {"type": "at", "data": {"qq": "all"}},
+                {"type": "text", "data": {"text": " " + text}},
+            ],
+        )
+        if not result.ok:
+            await self.log(event, "at_all", detail=result.error, success=False)
+            return f"发送失败：{result.error}"
+
+        await self.log(event, "at_all", detail=text[:60])
+        if isinstance(group_left, int):
+            return f"已发送 @全体成员（本群今日还剩 {max(group_left - 1, 0)} 次）"
+        return "已发送 @全体成员"
 
     # -------------------------------------------------------------- 管理员 --- #
     async def set_admin(self, event: AstrMessageEvent, enable: bool) -> str:

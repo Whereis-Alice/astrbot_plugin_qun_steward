@@ -46,6 +46,8 @@ class _FlowAlbum(AlbumFeature):
         self._default_cache = {}
         self._config = SimpleNamespace(album_dir=tmp_dir)
         self.actions: list[str] = []
+        # 上传成功后会让云端缓存失效，这里给个空壳即可
+        self.cloud = SimpleNamespace(invalidate=lambda *args, **kwargs: None)
 
     @property
     def config(self) -> SimpleNamespace:

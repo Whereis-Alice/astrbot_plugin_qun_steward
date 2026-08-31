@@ -198,6 +198,29 @@
         "type": "int",
         "default": 3
       },
+      "mode": {
+        "description": "计票方式",
+        "hint": "「贴表情」= 给投票消息贴 👍/👎 表情表态（更轻量，需协议端支持表情回应）；「发指令」= 用「赞同禁言 / 反对禁言」。",
+        "type": "string",
+        "default": "两者都行",
+        "options": [
+          "贴表情",
+          "发指令",
+          "两者都行"
+        ]
+      },
+      "agree_emoji": {
+        "description": "赞同表情 ID",
+        "hint": "QQ 表情 ID，76 = 赞（👍）、77 = 踩（👎）。只在「贴表情」计票时用到。",
+        "type": "string",
+        "default": "76"
+      },
+      "disagree_emoji": {
+        "description": "反对表情 ID",
+        "hint": "QQ 表情 ID，76 = 赞（👍）、77 = 踩（👎）。只在「贴表情」计票时用到。",
+        "type": "string",
+        "default": "77"
+      },
       "allow_self_vote": {
         "description": "允许被投票者本人投票",
         "type": "bool",
@@ -291,6 +314,12 @@
         "type": "list",
         "default": []
       },
+      "cloud_random": {
+        "description": "随机发图可读云端相册",
+        "hint": "开启后即使没有本地备份，也能直接从 QQ 云端相册里随机取图（需协议端支持相册列表接口）。",
+        "type": "bool",
+        "default": true
+      },
       "level_threshold": {
         "description": "上传群相册的群等级门槛",
         "hint": "0 表示不限制；群主/管理员始终放行。",
@@ -352,6 +381,51 @@
         "hint": "仅在开启自动下载时使用，需返回带 sha256 校验的 JSON 清单。",
         "type": "string",
         "default": "https://assets.foolsclub.xyz/astrbot/fonts/font_manifest.json"
+      }
+    }
+  },
+  "output": {
+    "description": "长列表输出",
+    "type": "object",
+    "items": {
+      "long_list_mode": {
+        "description": "长列表发送方式",
+        "hint": "审计日志、禁言列表、群友清理预览等天生很长的输出用哪种方式发。合并转发不刷屏且可复制；协议端不支持时自动回退成长图。",
+        "type": "string",
+        "default": "合并转发",
+        "options": [
+          "合并转发",
+          "长图",
+          "纯文本"
+        ]
+      },
+      "node_lines": {
+        "description": "合并转发每条包含行数",
+        "type": "int",
+        "default": 15,
+        "slider": {
+          "min": 5,
+          "max": 40,
+          "step": 1
+        }
+      }
+    }
+  },
+  "voice": {
+    "description": "AI 声聊",
+    "type": "object",
+    "items": {
+      "default_character": {
+        "description": "默认音色",
+        "hint": "留空则用协议端返回的第一个可用音色。可先用「声聊音色」查看本群可选音色。",
+        "type": "string",
+        "default": ""
+      },
+      "chat_type": {
+        "description": "音色分类",
+        "hint": "1 = 常规音色，2 = 声聊房专用音色。不确定就保持 1。",
+        "type": "int",
+        "default": 1
       }
     }
   },
@@ -422,6 +496,18 @@
       },
       "whole_ban": {
         "description": "全禁（全体禁言）",
+        "type": "string",
+        "default": "管理员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "at_all": {
+        "description": "全体成员（@全体成员通知）",
         "type": "string",
         "default": "管理员",
         "options": [
@@ -556,6 +642,18 @@
         "description": "群公告",
         "type": "string",
         "default": "成员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "del_group_notice": {
+        "description": "删除群公告",
+        "type": "string",
+        "default": "管理员",
         "options": [
           "超管",
           "群主",
@@ -708,6 +806,42 @@
           "成员"
         ]
       },
+      "group_info": {
+        "description": "群信息",
+        "type": "string",
+        "default": "成员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "group_honor": {
+        "description": "群荣誉（龙王 / 群榜单）",
+        "type": "string",
+        "default": "成员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "shut_list": {
+        "description": "禁言列表",
+        "type": "string",
+        "default": "成员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
       "upload_group_file": {
         "description": "上传群文件",
         "type": "string",
@@ -722,6 +856,18 @@
       },
       "delete_group_file": {
         "description": "删除群文件",
+        "type": "string",
+        "default": "管理员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "manage_group_file": {
+        "description": "管理群文件（移动 / 改名 / 整理）",
         "type": "string",
         "default": "管理员",
         "options": [
@@ -756,6 +902,30 @@
           "成员"
         ]
       },
+      "album_view": {
+        "description": "查看群相册",
+        "type": "string",
+        "default": "成员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "album_delete": {
+        "description": "删除相册图片",
+        "type": "string",
+        "default": "管理员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
       "audit_view": {
         "description": "操作日志",
         "type": "string",
@@ -772,6 +942,18 @@
         "description": "撤销（回滚最近一次禁言/踢人/拉黑）",
         "type": "string",
         "default": "管理员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "voice": {
+        "description": "AI 声聊（让机器人念台词）",
+        "type": "string",
+        "default": "成员",
         "options": [
           "超管",
           "群主",
