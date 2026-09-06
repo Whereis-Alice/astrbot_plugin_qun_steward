@@ -16,26 +16,41 @@ from __future__ import annotations
 import re
 import time
 from dataclasses import dataclass, field
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Literal
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 from .config import DISPLAY_NAME
 from .emoji_text import TextPainter
 from .fonts import FontResolver
+from .shapes import (
+    RGB,
+    SHIELD_RATIO,
+    dot,
+    drop_shadow,
+    fill_gradient,
+    fill_round,
+    gradient,
+    mix,
+    round_mask,
+    shield_mask,
+    soft_light,
+    stroke_round,
+)
 
 # ==================================================================== 配色 === #
 
 #: 语义色调，决定文字颜色与衬底颜色
 Tone = Literal["normal", "muted", "brand", "ok", "warn", "err"]
 
-BG = (243, 245, 252)
+#: 画布底色渐变的两端，比纯色底更有层次
+BG_1 = (237, 240, 251)
+BG_2 = (244, 241, 252)
 PANEL = (255, 255, 255)
 FOOTER_BG = (250, 251, 255)
-INSET = (241, 244, 252)
-BRAND_1 = (91, 140, 255)
+INSET = (247, 249, 254)
+BRAND_1 = (74, 125, 255)
 BRAND_2 = (123, 92, 255)
 BRAND_INK = (59, 91, 219)
 TEXT = (23, 27, 46)
@@ -58,6 +73,14 @@ _TONE_INK: dict[str, tuple[int, int, int]] = {
 #: 前三名的奖牌配色
 _MEDALS: tuple[tuple[int, int, int], ...] = ((235, 175, 40), (154, 165, 189), (198, 137, 74))
 
+#: 进度条填充用的渐变端点。大色块平涂容易发闷，加一点色相位移会通透很多
+_BAR_GRADIENT: dict[str, tuple[RGB, RGB]] = {
+    "brand": (BRAND_1, BRAND_2),
+    "ok": ((60, 200, 150), (16, 160, 118)),
+    "warn": ((240, 175, 60), (230, 140, 20)),
+    "err": ((250, 120, 110), (226, 66, 66)),
+}
+
 # ==================================================================== 尺度 === #
 
 #: 默认卡片宽度
@@ -70,7 +93,6 @@ _RADIUS = 22  # 面板圆角
 _PAD_X = 30  # 正文左右内边距
 _PAD_Y = 22  # 正文上下内边距
 _GAP = 13  # 相邻块的间距
-_AA = 4  # 圆角蒙版的超采样倍率
 _MAX_HEIGHT = 12000  # 高度上限，超出就截断，避免生成超大图
 
 _FS_TITLE = 30
@@ -82,6 +104,7 @@ _FS_SMALL = 13
 _FS_STAT = 27
 _FS_CELL = 15
 _FS_FOOT = 12
+_FS_ICON = 21
 
 #: 行高相对字号的倍率
 _LINE_RATIO = 1.62
@@ -92,165 +115,13 @@ def _lh(size: int) -> int:
     return round(size * _LINE_RATIO)
 
 
-def _mix(a: tuple[int, int, int], b: tuple[int, int, int], ratio: float) -> tuple[int, int, int]:
-    """按比例混合两个颜色。"""
-    return (
-        round(a[0] + (b[0] - a[0]) * ratio),
-        round(a[1] + (b[1] - a[1]) * ratio),
-        round(a[2] + (b[2] - a[2]) * ratio),
-    )
-
-
 def _ink(tone: str) -> tuple[int, int, int]:
     return _TONE_INK.get(tone, TEXT)
 
 
 def _soft(tone: str, ratio: float = 0.13) -> tuple[int, int, int]:
     """色调对应的浅色衬底。"""
-    return _mix(PANEL, _ink(tone), ratio)
-
-
-# ================================================================ 绘图工具 === #
-
-
-@lru_cache(maxsize=48)
-def _aa_circle(radius: int) -> Image.Image:
-    """抗锯齿圆形，用来贴圆角与画圆点。"""
-    size = max(1, radius) * 2
-    big = Image.new("L", (size * _AA, size * _AA), 0)
-    ImageDraw.Draw(big).ellipse((0, 0, size * _AA - 1, size * _AA - 1), fill=255)
-    return big.resize((size, size), Image.LANCZOS)
-
-
-def _round_mask(
-    width: int, height: int, radius: int, corners: tuple[bool, bool, bool, bool] = (True,) * 4
-) -> Image.Image:
-    """圆角矩形蒙版。
-
-    整块铺满再贴四个抗锯齿圆角，比把整张图超采样省一个数量级的内存。
-    corners 依次是左上、右上、右下、左下。
-    """
-    mask = Image.new("L", (max(1, width), max(1, height)), 255)
-    radius = max(0, min(radius, width // 2, height // 2))
-    if radius <= 0:
-        return mask
-    circle = _aa_circle(radius)
-    double = radius * 2
-    quads = (
-        (circle.crop((0, 0, radius, radius)), (0, 0)),
-        (circle.crop((radius, 0, double, radius)), (width - radius, 0)),
-        (circle.crop((radius, radius, double, double)), (width - radius, height - radius)),
-        (circle.crop((0, radius, radius, double)), (0, height - radius)),
-    )
-    for keep, (tile, pos) in zip(corners, quads, strict=True):
-        if keep:
-            mask.paste(tile, pos)
-    return mask
-
-
-def _fill_round(
-    base: Image.Image,
-    box: tuple[int, int, int, int],
-    color: tuple[int, int, int],
-    radius: int,
-    corners: tuple[bool, bool, bool, bool] = (True,) * 4,
-) -> None:
-    """画一个抗锯齿的圆角矩形色块。"""
-    x0, y0, x1, y1 = box
-    width, height = x1 - x0, y1 - y0
-    if width <= 0 or height <= 0:
-        return
-    base.paste(Image.new("RGB", (width, height), color), (x0, y0), _round_mask(width, height, radius, corners))
-
-
-def _gradient(
-    width: int,
-    height: int,
-    start: tuple[int, int, int],
-    end: tuple[int, int, int],
-    weights: tuple[float, float] = (0.5, 0.5),
-) -> Image.Image:
-    """线性渐变：先画 64x64 小图再放大，足够平滑也足够快。"""
-    steps = 64
-    span = steps - 1
-    pixels: list[tuple[int, int, int]] = []
-    weight_x, weight_y = weights
-    for y in range(steps):
-        base_y = y / span * weight_y
-        for x in range(steps):
-            pixels.append(_mix(start, end, x / span * weight_x + base_y))
-    small = Image.new("RGB", (steps, steps))
-    small.putdata(pixels)
-    return small.resize((max(1, width), max(1, height)), Image.LANCZOS)
-
-
-def _fill_gradient(
-    base: Image.Image,
-    box: tuple[int, int, int, int],
-    start: tuple[int, int, int],
-    end: tuple[int, int, int],
-    radius: int,
-    corners: tuple[bool, bool, bool, bool] = (True,) * 4,
-    weights: tuple[float, float] = (0.5, 0.5),
-) -> None:
-    """画一个抗锯齿的圆角渐变色块。"""
-    x0, y0, x1, y1 = box
-    width, height = x1 - x0, y1 - y0
-    if width <= 0 or height <= 0:
-        return
-    layer = _gradient(width, height, start, end, weights)
-    base.paste(layer, (x0, y0), _round_mask(width, height, radius, corners))
-
-
-def _drop_shadow(
-    base: Image.Image,
-    box: tuple[int, int, int, int],
-    radius: int,
-    *,
-    blur: int = 14,
-    offset: int = 7,
-    alpha: int = 46,
-) -> None:
-    """给面板加一层柔和投影，让卡片从背景里浮起来。"""
-    x0, y0, x1, y1 = box
-    width, height = x1 - x0, y1 - y0
-    if width <= 0 or height <= 0:
-        return
-    pad = blur * 3
-    layer = Image.new("L", (width + pad * 2, height + pad * 2), 0)
-    layer.paste(_round_mask(width, height, radius), (pad, pad))
-    layer = layer.filter(ImageFilter.GaussianBlur(blur)).point(lambda value: value * alpha // 255)
-    tint = Image.new("RGB", layer.size, (26, 36, 84))
-    base.paste(tint, (x0 - pad, y0 - pad + offset), layer)
-
-
-def _dot(base: Image.Image, center: tuple[int, int], radius: int, color: tuple[int, int, int]) -> None:
-    """画一个抗锯齿圆点。"""
-    circle = _aa_circle(radius)
-    base.paste(
-        Image.new("RGB", circle.size, color),
-        (center[0] - radius, center[1] - radius),
-        circle,
-    )
-
-
-def _glow(
-    base: Image.Image,
-    center: tuple[int, int],
-    radius: int,
-    color: tuple[int, int, int],
-    alpha: int = 58,
-) -> None:
-    """背景柔光斑：纯色底太平，加两团光晕才有层次。
-
-    先在 48x48 上画糊再放大，不管半径多大耗时都一样。
-    """
-    small = Image.new("L", (48, 48), 0)
-    ImageDraw.Draw(small).ellipse((7, 7, 40, 40), fill=alpha)
-    layer = small.filter(ImageFilter.GaussianBlur(7)).resize(
-        (max(2, radius) * 2,) * 2, Image.LANCZOS
-    )
-    base.paste(Image.new("RGB", layer.size, color), (center[0] - radius, center[1] - radius), layer)
+    return mix(PANEL, _ink(tone), ratio)
 
 
 # ==================================================================== 内容 === #
@@ -275,7 +146,7 @@ class Heading:
 
 @dataclass(slots=True)
 class KeyValue:
-    """字段表：左键右值，隔行浅底。"""
+    """字段表：左键右值，整表一个浅底容器。"""
 
     rows: list[tuple[str, str]] = field(default_factory=list)
 
@@ -625,12 +496,13 @@ def from_markdown(
 
 #: 各组件的固定尺寸
 _HEAD_TOP = 7  # 小节标题上方额外留白
-_KV_PAD = 6  # 字段表行内上下留白
+_HEAD_PAD = 18  # 没有副标题时标题条的上下留白，比正文留白紧一点
+_KV_PAD = 8  # 字段表行内上下留白
 _CELL_GAP = 12  # 统计格 / 标签之间的间距
 _STAT_PAD = 13  # 统计格内边距
 _BULLET_INDENT = 22
 _BULLET_GAP = 4
-_RANK_ROW = 40
+_RANK_ROW = 44
 _RANK_GAP = 6
 _TAG_H = 28
 _TAG_PAD = 14
@@ -638,8 +510,10 @@ _TAG_GAP = 8
 _TABLE_PAD_X = 12
 _TABLE_PAD_Y = 8
 _NOTE_PAD = 11
-_TRACK_H = 12  # 进度条轨道高度
-_ICON = 44  # 标题左侧徽标边长
+_TRACK_H = 14  # 进度条轨道高度
+_BADGE_H = 28  # 标题右侧胶囊高度
+_ICON = 40  # 标题左侧盾牌徽标的宽度
+_ICON_H = round(_ICON * SHIELD_RATIO)  # 盾牌竖长，高度按 logo 的比例推
 _FOOTER_H = 42
 
 #: 进度条自动转警示色的阈值
@@ -763,7 +637,15 @@ class CardRenderer:
         if align != "left":
             span = self.painter.measure(text, font)
             x -= span if align == "right" else span // 2
-        self.painter.draw(base, draw, (x, y + round(size * 0.11)), text, font, color)
+        self.painter.draw(
+            base,
+            draw,
+            (x, y + round(size * 0.11)),
+            text,
+            font,
+            color,
+            stroke=1 if bold and self.fonts.needs_synthetic_bold() else 0,
+        )
 
     # ---------------------------------------------------------------- 分发
 
@@ -813,14 +695,13 @@ class CardRenderer:
             pieces.append(tail)
             total += tail.height + _GAP
 
-        base = Image.new("RGB", (width, total), BG)
-        _glow(base, (0, round(total * 0.05)), round(width * 0.46), BRAND_1)
-        _glow(base, (width, total - round(total * 0.08)), round(width * 0.40), BRAND_2)
+        # 底色走一层极淡的蓝紫渐变：比纯色有层次，也不会在面板外留下光斑的硬边
+        base = gradient(width, total, BG_1, BG_2, (0.45, 0.55))
         draw = ImageDraw.Draw(base)
 
         panel = (_MARGIN, _MARGIN, _MARGIN + panel_w, total - _MARGIN)
-        _drop_shadow(base, panel, _RADIUS)
-        _fill_round(base, panel, PANEL, _RADIUS)
+        drop_shadow(base, panel, _RADIUS)
+        fill_round(base, panel, PANEL, _RADIUS)
         self._draw_header(base, draw, card, panel, head_h)
         self._draw_footer(base, draw, card, panel)
 
@@ -849,10 +730,12 @@ class CardRenderer:
     # ------------------------------------------------------------ 卡片骨架
 
     def _header_height(self, card: Card) -> int:
-        height = _PAD_Y * 2 + _lh(_FS_TITLE)
+        # 只有一行标题时收紧留白，免得标题条空出一大片
+        pad = _PAD_Y if card.subtitle else _HEAD_PAD
+        height = pad * 2 + _lh(_FS_TITLE)
         if card.subtitle:
             height += _lh(_FS_SUB)
-        return max(height, _ICON + _PAD_Y * 2)
+        return max(height, _ICON_H + pad * 2)
 
     def _draw_header(
         self,
@@ -862,19 +745,20 @@ class CardRenderer:
         panel: tuple[int, int, int, int],
         head_h: int,
     ) -> None:
-        """标题条：品牌渐变底 + 徽标 + 标题 / 副标题 / 右侧胶囊。"""
+        """标题条：品牌渐变底 + 左上柔光 + 徽标 + 标题 / 副标题 / 右侧胶囊。"""
         x0, y0, x1, _ = panel
-        _fill_gradient(
-            base,
-            (x0, y0, x1, y0 + head_h),
-            BRAND_1,
-            BRAND_2,
-            _RADIUS,
-            (True, True, False, False),
-            (0.82, 0.18),
+        span = x1 - x0
+        layer = gradient(span, head_h, BRAND_1, BRAND_2, (0.82, 0.18))
+        # 柔光画在整层上、最后统一按圆角蒙版裁掉，所以不会像直接糊在画布上那样露出方边
+        soft_light(
+            layer,
+            (-span * 0.12, -head_h * 1.15, span * 0.52, head_h * 1.0),
+            58,
+            head_h * 0.55,
         )
+        base.paste(layer, (x0, y0), round_mask(span, head_h, _RADIUS, (True, True, False, False)))
 
-        icon_x, icon_y = x0 + _PAD_X, y0 + (head_h - _ICON) // 2
+        icon_x, icon_y = x0 + _PAD_X, y0 + (head_h - _ICON_H) // 2
         self._draw_icon(base, draw, icon_x, icon_y)
 
         text_x = icon_x + _ICON + 16
@@ -883,14 +767,15 @@ class CardRenderer:
 
         if card.badge:
             badge_w = self._measure(card.badge, _FS_BADGE, bold=True) + 26
-            badge_y = title_y + (_lh(_FS_TITLE) - 28) // 2
-            _fill_round(
-                base, (right - badge_w, badge_y, right, badge_y + 28), _mix(BRAND_2, PANEL, 0.3), 14
-            )
+            badge_y = title_y + (_lh(_FS_TITLE) - _BADGE_H) // 2
+            capsule = (right - badge_w, badge_y, right, badge_y + _BADGE_H)
+            # 浅底 + 更浅的描边，做出磨砂胶囊的感觉，纯色块压在渐变上会很生硬
+            fill_round(base, capsule, mix(BRAND_2, PANEL, 0.28), _BADGE_H // 2)
+            stroke_round(base, capsule, mix(BRAND_2, PANEL, 0.62), _BADGE_H // 2)
             self._line(
                 base,
                 draw,
-                (right - badge_w // 2, badge_y + (28 - _lh(_FS_BADGE)) // 2),
+                (right - badge_w // 2, badge_y + (_BADGE_H - _lh(_FS_BADGE)) // 2),
                 card.badge,
                 _FS_BADGE,
                 PANEL,
@@ -909,28 +794,30 @@ class CardRenderer:
                 (text_x, title_y + _lh(_FS_TITLE)),
                 subtitle,
                 _FS_SUB,
-                _mix(BRAND_2, PANEL, 0.76),
+                mix(BRAND_2, PANEL, 0.76),
             )
 
     def _draw_icon(self, base: Image.Image, draw: ImageDraw.ImageDraw, x: int, y: int) -> None:
-        """白色圆角方块 + 「群」字，和插件 logo 用同一套视觉。"""
-        _fill_round(base, (x, y, x + _ICON, y + _ICON), PANEL, 14)
+        """白色盾牌 + 「群」字：和 logo 共用 shapes.shield_mask，轮廓完全一致。"""
+        mask = shield_mask(_ICON)
+        base.paste(Image.new("RGB", mask.size, PANEL), (x, y), mask)
+        # 盾牌下半收窄，视觉重心比几何中心高，字压在 0.40 处才居中
+        center_x, center_y = x + _ICON // 2, y + round(_ICON_H * 0.40)
         if self.fonts.resolve(False) is not None or self.fonts.resolve(True) is not None:
             self._line(
                 base,
                 draw,
-                (x + _ICON // 2, y + (_ICON - _lh(26)) // 2),
+                (center_x, center_y - _lh(_FS_ICON) // 2),
                 "群",
-                26,
+                _FS_ICON,
                 BRAND_INK,
                 bold=True,
                 align="center",
             )
             return
         # 没有中文字体时退化成三点「成员」图形，和 logo 脚本的降级方案一致
-        center = (x + _ICON // 2, y + _ICON // 2)
-        for dx, dy in ((0, -8), (-9, 6), (9, 6)):
-            _dot(base, (center[0] + dx, center[1] + dy), 4, BRAND_INK)
+        for dx, dy in ((0, -7), (-8, 5), (8, 5)):
+            dot(base, (center_x + dx, center_y + dy), 4, BRAND_INK)
 
     def _draw_footer(
         self,
@@ -942,7 +829,7 @@ class CardRenderer:
         """页脚：左边放数据说明，右边固定署名。"""
         x0, _, x1, y1 = panel
         top = y1 - _FOOTER_H
-        _fill_round(base, (x0, top, x1, y1), FOOTER_BG, _RADIUS, (False, False, True, True))
+        fill_round(base, (x0, top, x1, y1), FOOTER_BG, _RADIUS, (False, False, True, True))
         draw.line((x0 + 1, top, x1 - 2, top), fill=LINE)
 
         text_y = top + (_FOOTER_H - _lh(_FS_FOOT)) // 2
@@ -963,11 +850,17 @@ class CardRenderer:
             (x1 - _PAD_X, text_y),
             DISPLAY_NAME,
             _FS_FOOT,
-            _mix(TEXT_3, BRAND_INK, 0.55),
+            mix(TEXT_3, BRAND_INK, 0.55),
             bold=True,
             align="right",
         )
-        _dot(base, (x1 - _PAD_X - name_w - 10, top + _FOOTER_H // 2), 3, BRAND_1)
+        # 署名前放一枚迷你盾，和标题徽标、logo 是同一条轮廓
+        mark = shield_mask(11)
+        base.paste(
+            Image.new("RGB", mark.size, mix(BRAND_1, BRAND_2, 0.35)),
+            (x1 - _PAD_X - name_w - 19, top + (_FOOTER_H - mark.height) // 2),
+            mark,
+        )
 
     # ------------------------------------------------------------ 正文 / 标题
 
@@ -1011,10 +904,15 @@ class CardRenderer:
     ) -> None:
         text, note = piece.data
         top = y + _HEAD_TOP
-        _fill_gradient(
-            base, (x, top + 4, x + 4, top + _lh(_FS_HEAD) - 4), BRAND_1, BRAND_2, 2, weights=(0.0, 1.0)
+        fill_gradient(
+            base,
+            (x, top + 3, x + 5, top + _lh(_FS_HEAD) - 3),
+            BRAND_1,
+            BRAND_2,
+            2,
+            weights=(0.0, 1.0),
         )
-        self._line(base, draw, (x + 14, top), text, _FS_HEAD, TEXT, bold=True)
+        self._line(base, draw, (x + 15, top), text, _FS_HEAD, TEXT, bold=True)
         if note:
             offset = (_lh(_FS_HEAD) - _lh(_FS_SMALL)) // 2
             self._line(base, draw, (x + width, top + offset), note, _FS_SMALL, TEXT_3, align="right")
@@ -1046,16 +944,20 @@ class CardRenderer:
         width: int,
     ) -> None:
         key_w, prepared = piece.data
+        bottom = y + piece.height
+        # 整表一个浅底容器 + 行间细线，比隔行灰块干净，也不会把长表格切得一条一条
+        fill_round(base, (x, y, x + width, bottom), INSET, 12)
+        stroke_round(base, (x, y, x + width, bottom), LINE, 12)
         top = y
         for index, (key, lines, row_h) in enumerate(prepared):
-            if index % 2 == 0:  # 隔行浅底，长表格才看得清哪个值对哪个键
-                _fill_round(base, (x, top, x + width, top + row_h), INSET, 10)
-            self._line(base, draw, (x + 12, top + _KV_PAD), key, _FS_BODY, TEXT_2)
+            if index:
+                draw.line((x + 14, top, x + width - 14, top), fill=mix(LINE, PANEL, 0.35))
+            self._line(base, draw, (x + 14, top + _KV_PAD), key, _FS_BODY, TEXT_3)
             for offset, line in enumerate(lines):
                 self._line(
                     base,
                     draw,
-                    (x + key_w + 12, top + _KV_PAD + offset * _lh(_FS_BODY)),
+                    (x + key_w + 14, top + _KV_PAD + offset * _lh(_FS_BODY)),
                     line,
                     _FS_BODY,
                     TEXT,
@@ -1075,13 +977,16 @@ class CardRenderer:
 
     def _prep_bar(self, block: Bar, width: int) -> _Piece:
         ratio = min(1.0, max(0.0, block.ratio))
-        value = block.value or f"{round(ratio * 100)}%"
+        percent = f"{round(ratio * 100)}%"
+        value = block.value or percent
         label = self._fit(block.label, _FS_BODY, width - self._measure(value, _FS_BODY, True) - 16)
-        notes = self._wrap(block.note, _FS_SMALL, width) if block.note.strip() else []
-        height = _lh(_FS_BODY) + 4 + _TRACK_H
-        if notes:
-            height += 6 + len(notes) * _lh(_FS_SMALL)
-        return _Piece(block, height, (label, value, notes, ratio))
+        # 右上角已经是百分比时就不再重复标一次
+        percent = percent if ratio > 0 and value != percent else ""
+        notes = self._wrap(block.note, _FS_SMALL, width - 60) if block.note.strip() else []
+        height = _lh(_FS_BODY) + 5 + _TRACK_H
+        if notes or percent:
+            height += 6 + max(1, len(notes)) * _lh(_FS_SMALL)
+        return _Piece(block, height, (label, value, notes, ratio, percent))
 
     def _draw_bar(
         self,
@@ -1092,24 +997,33 @@ class CardRenderer:
         y: int,
         width: int,
     ) -> None:
-        label, value, notes, ratio = piece.data
+        label, value, notes, ratio, percent = piece.data
         tone = self._bar_tone(piece.block)
         radius = _TRACK_H // 2
         self._line(base, draw, (x, y), label, _FS_BODY, TEXT)
         self._line(base, draw, (x + width, y), value, _FS_BODY, _ink(tone), bold=True, align="right")
 
-        track_y = y + _lh(_FS_BODY) + 4
-        _fill_round(base, (x, track_y, x + width, track_y + _TRACK_H), LINE, radius)
+        track_y = y + _lh(_FS_BODY) + 5
+        fill_round(base, (x, track_y, x + width, track_y + _TRACK_H), mix(LINE, TEXT_3, 0.12), radius)
         if ratio > 0:
+            start, end = _BAR_GRADIENT.get(tone, (_ink(tone), _ink(tone)))
             box = (x, track_y, x + max(_TRACK_H, round(width * ratio)), track_y + _TRACK_H)
-            if tone == "brand":
-                _fill_gradient(base, box, BRAND_1, BRAND_2, radius, weights=(1.0, 0.0))
-            else:
-                _fill_round(base, box, _ink(tone), radius)
+            fill_gradient(base, box, start, end, radius, weights=(1.0, 0.0))
 
         note_y = track_y + _TRACK_H + 6
         for index, line in enumerate(notes):
             self._line(base, draw, (x, note_y + index * _lh(_FS_SMALL)), line, _FS_SMALL, TEXT_3)
+        if percent:
+            self._line(
+                base,
+                draw,
+                (x + width, note_y),
+                percent,
+                _FS_SMALL,
+                _ink(tone),
+                bold=True,
+                align="right",
+            )
 
     # ---------------------------------------------------------------- 统计格
 
@@ -1154,7 +1068,10 @@ class CardRenderer:
             # 最后一列直接顶到右边，把整除留下的零头补掉
             right = x + width if column == columns - 1 else left + cell_w
             top = y + (index // columns) * (cell_h + _CELL_GAP)
-            _fill_round(base, (left, top, right, top + cell_h), INSET, 14)
+            box = (left, top, right, top + cell_h)
+            # 底色跟着数字的语义色走一点点，加描边把每格框住，比一律灰底有信息量
+            fill_round(base, box, _soft(tone, 0.07), 14)
+            stroke_round(base, box, mix(LINE, _ink(tone), 0.30), 14)
 
             center = (left + right) // 2
             line_y = top + _STAT_PAD
@@ -1203,7 +1120,7 @@ class CardRenderer:
                     align="right",
                 )
             else:
-                _dot(base, (x + 6, top + _lh(_FS_BODY) // 2), 3, BRAND_1)
+                dot(base, (x + 6, top + _lh(_FS_BODY) // 2), 3, BRAND_1)
             for order, line in enumerate(lines):
                 self._line(
                     base,
@@ -1226,7 +1143,7 @@ class CardRenderer:
         for row in rows:
             note = self._fit(row.note, _FS_SMALL, round(width * 0.34))
             note_px = self._measure(note, _FS_SMALL) + 14 if note else 0
-            limit = width - 56 - value_w - note_px
+            limit = width - 60 - value_w - note_px
             name = self._fit(row.name, _FS_BODY, limit, bold=True)
             prepared.append((name, note, row.value, min(1.0, max(0.0, row.weight))))
         height = len(rows) * _RANK_ROW + (len(rows) - 1) * _RANK_GAP
@@ -1245,29 +1162,44 @@ class CardRenderer:
         medals = piece.block.medals
         for index, (name, note, value, weight) in enumerate(prepared):
             top = y + index * (_RANK_ROW + _RANK_GAP)
-            _fill_round(base, (x, top, x + width, top + _RANK_ROW), INSET, 13)
+            row = (x, top, x + width, top + _RANK_ROW)
+            fill_round(base, row, mix(PANEL, BRAND_1, 0.045), 13)
             if weight > 0:  # 背景比例条，一眼看出差距
                 bar_w = max(_RANK_ROW, round(width * weight))
-                _fill_round(base, (x, top, x + bar_w, top + _RANK_ROW), _mix(PANEL, BRAND_1, 0.14), 13)
+                fill_gradient(
+                    base,
+                    (x, top, x + bar_w, top + _RANK_ROW),
+                    mix(PANEL, BRAND_1, 0.22),
+                    mix(PANEL, BRAND_2, 0.14),
+                    13,
+                    weights=(1.0, 0.0),
+                )
+            stroke_round(base, row, LINE, 13)
 
-            color = _MEDALS[index] if medals and index < len(_MEDALS) else _mix(PANEL, BRAND_1, 0.45)
-            _dot(base, (x + 22, top + _RANK_ROW // 2), 13, color)
+            # 前三名用奖牌色的实心圆，之后改浅底深字，免得一整列都是深色圆点
+            if medals and index < len(_MEDALS):
+                chip, chip_ink = _MEDALS[index], PANEL
+            else:
+                chip, chip_ink = mix(PANEL, BRAND_1, 0.18), BRAND_INK
+            dot(base, (x + 24, top + _RANK_ROW // 2), 13, chip)
             self._line(
                 base,
                 draw,
-                (x + 22, top + (_RANK_ROW - _lh(_FS_SMALL)) // 2),
+                (x + 24, top + (_RANK_ROW - _lh(_FS_SMALL)) // 2),
                 str(index + 1),
                 _FS_SMALL,
-                PANEL,
+                chip_ink,
                 bold=True,
                 align="center",
             )
             body_y = top + (_RANK_ROW - _lh(_FS_BODY)) // 2
-            self._line(base, draw, (x + 42, body_y), name, _FS_BODY, TEXT, bold=True)
+            self._line(base, draw, (x + 45, body_y), name, _FS_BODY, TEXT, bold=True)
 
-            right = x + width - 14
+            right = x + width - 16
             if value:
-                self._line(base, draw, (right, body_y), value, _FS_BODY, BRAND_INK, bold=True, align="right")
+                self._line(
+                    base, draw, (right, body_y), value, _FS_BODY, BRAND_INK, bold=True, align="right"
+                )
                 right -= value_w + 14
             if note:
                 small_y = top + (_RANK_ROW - _lh(_FS_SMALL)) // 2
@@ -1303,9 +1235,9 @@ class CardRenderer:
     ) -> None:
         for text, tone, left, row, span in piece.data:
             top = y + row * (_TAG_H + _TAG_GAP)
-            _fill_round(
-                base, (x + left, top, x + left + span, top + _TAG_H), _soft(tone, 0.16), _TAG_H // 2
-            )
+            pill = (x + left, top, x + left + span, top + _TAG_H)
+            fill_round(base, pill, _soft(tone, 0.16), _TAG_H // 2)
+            stroke_round(base, pill, _soft(tone, 0.42), _TAG_H // 2)
             self._line(
                 base,
                 draw,
@@ -1377,20 +1309,38 @@ class CardRenderer:
     ) -> None:
         widths, titles, head_h, body = piece.data
         step = _TABLE_PAD_X * 2
+        frame = (x, y, x + width, y + piece.height)
+        # 整表套一个圆角容器：表头浅品牌底、行间细线，边界清楚也不会抢正文的注意力
+        fill_round(base, frame, PANEL, 12)
 
         if head_h:
-            _fill_round(base, (x, y, x + width, y + head_h), INSET, 10, (True, True, False, False))
+            fill_round(
+                base,
+                (x, y, x + width, y + head_h),
+                mix(PANEL, BRAND_1, 0.10),
+                12,
+                (True, True, False, False),
+            )
             left = x
             for index, label in enumerate(titles):
                 self._line(
-                    base, draw, (left + _TABLE_PAD_X, y + _TABLE_PAD_Y), label, _FS_SMALL, TEXT_2, bold=True
+                    base,
+                    draw,
+                    (left + _TABLE_PAD_X, y + _TABLE_PAD_Y),
+                    label,
+                    _FS_SMALL,
+                    BRAND_INK,
+                    bold=True,
                 )
                 left += widths[index] + step
 
         top = y + head_h
         for order, (cells, row_h) in enumerate(body):
             if order:
-                draw.line((x + 6, top, x + width - 6, top), fill=LINE)
+                draw.line(
+                    (x + _TABLE_PAD_X, top, x + width - _TABLE_PAD_X, top),
+                    fill=mix(LINE, PANEL, 0.35),
+                )
             left = x
             for index, lines in enumerate(cells):
                 color = TEXT if index == 0 else TEXT_2
@@ -1405,6 +1355,7 @@ class CardRenderer:
                     )
                 left += widths[index] + step
             top += row_h
+        stroke_round(base, frame, LINE, 12)
 
     # -------------------------------------------------------------- 提示条等
 
@@ -1425,8 +1376,9 @@ class CardRenderer:
     ) -> None:
         tone = piece.block.tone
         bottom = y + piece.height
-        _fill_round(base, (x, y, x + width, bottom), _soft(tone, 0.15), 12)
-        _fill_round(base, (x, y + 8, x + 4, bottom - 8), _ink(tone), 2)
+        fill_round(base, (x, y, x + width, bottom), _soft(tone, 0.15), 12)
+        stroke_round(base, (x, y, x + width, bottom), _soft(tone, 0.38), 12)
+        fill_round(base, (x, y + 8, x + 4, bottom - 8), _ink(tone), 2)
         for index, line in enumerate(piece.data):
             self._line(
                 base,
@@ -1449,4 +1401,4 @@ class CardRenderer:
         y: int,
         width: int,
     ) -> None:
-        draw.line((x, y + 4, x + width, y + 4), fill=_mix(LINE, TEXT_3, 0.35))
+        draw.line((x, y + 4, x + width, y + 4), fill=mix(LINE, TEXT_3, 0.28))

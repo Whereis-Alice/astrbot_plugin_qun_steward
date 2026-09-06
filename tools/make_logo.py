@@ -2,13 +2,21 @@
 
 依赖 Pillow：python tools/make_logo.py
 输出 512x512 圆角渐变徽标，内含盾牌与「群」字，用于 AstrBot 插件市场与管理页展示。
+
+盾牌轮廓、渐变、柔光都取自 core.shapes，和卡片徽标共用同一套原语 —— 改一处两边一起变，
+不会出现「logo 是一个形状、卡片里又是另一个形状」。
 """
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.shapes import gradient, round_mask, shield_points, soft_light
 
 SIZE = 512
 SS = 4  # 超采样倍率，保证边缘平滑
@@ -25,61 +33,6 @@ FONT_CANDIDATES = [
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
     "/System/Library/Fonts/PingFang.ttc",
 ]
-
-
-def gradient(width: int, height: int) -> Image.Image:
-    """对角线性渐变：先画小图再放大，既快又平滑。"""
-    small = Image.new("RGB", (64, 64))
-    pixels = []
-    for y in range(64):
-        for x in range(64):
-            ratio = (x / 63 * 0.35) + (y / 63 * 0.65)
-            pixels.append(
-                tuple(
-                    round(TOP_COLOR[i] + (BOTTOM_COLOR[i] - TOP_COLOR[i]) * ratio)
-                    for i in range(3)
-                )
-            )
-    small.putdata(pixels)
-    return small.resize((width, height), Image.LANCZOS)
-
-
-def rounded_mask(width: int, height: int, radius: int) -> Image.Image:
-    mask = Image.new("L", (width, height), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, width - 1, height - 1), radius, fill=255)
-    return mask
-
-
-def qbezier(p0, p1, p2, steps: int = 48):
-    out = []
-    for i in range(steps + 1):
-        t = i / steps
-        inv = 1 - t
-        out.append(
-            (
-                inv * inv * p0[0] + 2 * inv * t * p1[0] + t * t * p2[0],
-                inv * inv * p0[1] + 2 * inv * t * p1[1] + t * t * p2[1],
-            )
-        )
-    return out
-
-
-def shield_polygon(cx: float, top: float, width: float, height: float) -> list[tuple[float, float]]:
-    """经典盾牌轮廓：平顶圆角 + 下方收拢到尖角。"""
-    half = width / 2
-    left, right = cx - half, cx + half
-    radius = width * 0.20
-    shoulder = top + height * 0.46
-    bottom = top + height
-
-    points: list[tuple[float, float]] = []
-    points += qbezier((left + radius, top), (left, top), (left, top + radius), 18)
-    points.append((left, shoulder))
-    points += qbezier((left, shoulder), (left + width * 0.015, bottom - height * 0.20), (cx, bottom), 48)
-    points += qbezier((cx, bottom), (right - width * 0.015, bottom - height * 0.20), (right, shoulder), 48)
-    points.append((right, top + radius))
-    points += qbezier((right, top + radius), (right, top), (right - radius, top), 18)
-    return points
 
 
 def load_font(size: int) -> ImageFont.FreeTypeFont | None:
@@ -112,15 +65,10 @@ def draw_glyph(base: Image.Image, cx: float, cy: float, box: float) -> None:
 
 
 def build() -> Image.Image:
-    card = gradient(CANVAS, CANVAS).convert("RGBA")
-
+    card = gradient(CANVAS, CANVAS, TOP_COLOR, BOTTOM_COLOR, (0.35, 0.65))
     # 左上柔光，让纯渐变不至于太平
-    glow = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
-    ImageDraw.Draw(glow).ellipse(
-        (-CANVAS * 0.60, -CANVAS * 0.95, CANVAS * 1.10, CANVAS * 0.28),
-        fill=(255, 255, 255, 40),
-    )
-    card.alpha_composite(glow.filter(ImageFilter.GaussianBlur(CANVAS * 0.06)))
+    soft_light(card, (-CANVAS * 0.60, -CANVAS * 0.95, CANVAS * 1.10, CANVAS * 0.28), 40, CANVAS * 0.06)
+    card = card.convert("RGBA")
 
     shield_w = CANVAS * 0.54
     shield_h = CANVAS * 0.64
@@ -129,12 +77,14 @@ def build() -> Image.Image:
 
     shadow = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
     ImageDraw.Draw(shadow).polygon(
-        shield_polygon(cx, top + CANVAS * 0.018, shield_w, shield_h), fill=(20, 30, 70, 90)
+        shield_points(cx, top + CANVAS * 0.018, shield_w, shield_h), fill=(20, 30, 70, 90)
     )
     card.alpha_composite(shadow.filter(ImageFilter.GaussianBlur(CANVAS * 0.014)))
 
     shield = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
-    ImageDraw.Draw(shield).polygon(shield_polygon(cx, top, shield_w, shield_h), fill=(255, 255, 255, 250))
+    ImageDraw.Draw(shield).polygon(
+        shield_points(cx, top, shield_w, shield_h), fill=(255, 255, 255, 250)
+    )
     card.alpha_composite(shield)
 
     draw_glyph(card, cx, top + shield_h * 0.365, shield_w * 0.54)
@@ -152,7 +102,7 @@ def build() -> Image.Image:
         )
     card.alpha_composite(dots)
 
-    card.putalpha(rounded_mask(CANVAS, CANVAS, int(CANVAS * 0.225)))
+    card.putalpha(round_mask(CANVAS, CANVAS, int(CANVAS * 0.225)))
     return card.resize((SIZE, SIZE), Image.LANCZOS)
 
 

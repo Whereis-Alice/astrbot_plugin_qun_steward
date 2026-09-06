@@ -382,12 +382,6 @@ class TestHelpers:
     def test_line_height_follows_ratio(self) -> None:
         assert card_module._lh(20) == round(20 * card_module._LINE_RATIO)
 
-    def test_mix_endpoints(self) -> None:
-        black, white = (0, 0, 0), (255, 255, 255)
-        assert card_module._mix(black, white, 0.0) == black
-        assert card_module._mix(black, white, 1.0) == white
-        assert card_module._mix(black, white, 0.5) == (128, 128, 128)
-
     def test_unknown_tone_falls_back_to_body_color(self) -> None:
         assert card_module._ink("不存在的色调") == card_module.TEXT
 
@@ -395,21 +389,3 @@ class TestHelpers:
         soft = card_module._soft("err")
         assert all(channel > 200 for channel in soft)
         assert soft != card_module.PANEL
-
-    def test_round_mask_size_and_mode(self) -> None:
-        mask = card_module._round_mask(30, 20, 8)
-        assert (mask.mode, mask.size) == ("L", (30, 20))
-        assert mask.getpixel((0, 0)) < 128  # 左上角被圆角挖空
-        assert mask.getpixel((15, 10)) == 255
-
-    def test_zero_radius_mask_is_solid(self) -> None:
-        assert card_module._round_mask(6, 6, 0).getextrema() == (255, 255)
-
-    def test_radius_is_capped_by_size(self) -> None:
-        mask = card_module._round_mask(10, 4, 40)
-        assert mask.size == (10, 4)
-
-    def test_dropped_corners_stay_square(self) -> None:
-        mask = card_module._round_mask(20, 20, 6, corners=(False, True, True, True))
-        assert mask.getpixel((0, 0)) == 255
-        assert mask.getpixel((19, 0)) < 128

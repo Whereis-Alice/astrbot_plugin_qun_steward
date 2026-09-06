@@ -28,24 +28,46 @@ _NOTO_NAMES = {
     True: ("NotoSansSC-Bold.ttf", "NotoSansSC-Bold.otf"),
 }
 
-#: 各平台常见的中文字体，按可读性排序
-_SYSTEM_FONTS: dict[str, tuple[str, ...]] = {
-    "win32": (
-        "C:/Windows/Fonts/msyh.ttc",
-        "C:/Windows/Fonts/msyhbd.ttc",
-        "C:/Windows/Fonts/simhei.ttf",
-    ),
-    "darwin": (
-        "/System/Library/Fonts/PingFang.ttc",
-        "/System/Library/Fonts/Hiragino Sans GB.ttc",
-    ),
-    "linux": (
-        "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
-        "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ),
+#: 各平台常见的中文字体，按「先粗体后常规」分组，可读性优先
+#:
+#: 必须按粗细分组：如果把常规体和粗体混在一张列表里，粗体请求会先命中列表最前面的
+#: 常规体，整张卡片就没有字重层次了（v1.2.0 在 Windows 上就踩了这个坑）。
+_SYSTEM_FONTS: dict[str, dict[bool, tuple[str, ...]]] = {
+    "win32": {
+        False: (
+            "C:/Windows/Fonts/msyh.ttc",
+            "C:/Windows/Fonts/simsun.ttc",
+        ),
+        True: (
+            "C:/Windows/Fonts/msyhbd.ttc",
+            "C:/Windows/Fonts/simhei.ttf",
+        ),
+    },
+    "darwin": {
+        False: (
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ),
+        True: (
+            "/System/Library/Fonts/PingFang.ttc",
+            "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        ),
+    },
+    "linux": {
+        False: (
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ),
+        True: (
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Bold.otf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Bold.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ),
+    },
 }
 
 
@@ -96,7 +118,9 @@ class FontResolver:
         for name in _NOTO_NAMES[not bold]:
             paths.append(font_dir / name)
 
-        paths.extend(Path(p) for p in _SYSTEM_FONTS[_platform_key()])
+        system = _SYSTEM_FONTS[_platform_key()]
+        paths.extend(Path(p) for p in system[bold])
+        paths.extend(Path(p) for p in system[not bold])
         return paths
 
     def resolve(self, bold: bool = False) -> Path | None:
@@ -118,6 +142,15 @@ class FontResolver:
                 continue
         self._resolved[bold] = found
         return found
+
+    def needs_synthetic_bold(self) -> bool:
+        """粗体字重是否需要靠描边伪造。
+
+        很多精简系统只装了常规体，此时 resolve(True) 会退回常规体文件，标题和正文
+        就一样粗了。绘制层据此给粗体文字加 1px 描边，保住字重层次。
+        """
+        bold = self.resolve(True)
+        return bold is None or bold == self.resolve(False)
 
     def resolve_emoji(self) -> Path | None:
         """找一款彩色 emoji 字体：自定义路径 → 数据目录 → 系统自带。"""

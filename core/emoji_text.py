@@ -293,10 +293,13 @@ class TextPainter:
         text: str,
         font: Any,
         fill: Any,
+        *,
+        stroke: int = 0,
     ) -> int:
         """在 canvas 上绘制一行混排文本，返回占用宽度。
 
-        xy 与 Pillow 默认锚点一致，指行的左上角。
+        xy 与 Pillow 默认锚点一致，指行的左上角；stroke 用同色描边伪造粗体，
+        系统只装了常规字体时靠它撑出字重差异。
         """
         x, y = int(xy[0]), int(xy[1])
         start = x
@@ -309,7 +312,7 @@ class TextPainter:
                 return
             chunk = "".join(buffer)
             buffer.clear()
-            draw.text((x, y), chunk, font=font, fill=fill)
+            draw.text((x, y), chunk, font=font, fill=fill, stroke_width=stroke, stroke_fill=fill)
             x += _length(font, chunk)
 
         for cluster, is_emoji in iter_clusters(text):
