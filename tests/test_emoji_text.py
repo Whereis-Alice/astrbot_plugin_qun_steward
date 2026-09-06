@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from astrbot_plugin_qun_steward.features.album.emoji_text import (
+from astrbot_plugin_qun_steward.core.emoji_text import (
     SYSTEM_EMOJI_FONTS,
     EmojiFont,
     TextPainter,

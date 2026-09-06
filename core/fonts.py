@@ -18,9 +18,9 @@ from typing import Any
 from astrbot.api import logger
 from PIL import ImageFont
 
-from ...core.config import LOG_TAG, StewardConfig
-from ...core.utils import download_bytes
+from .config import LOG_TAG, StewardConfig
 from .emoji_text import SYSTEM_EMOJI_FONTS, EmojiFont
+from .utils import download_bytes
 
 #: 数据目录 / 系统目录里会去找的字体文件名
 _NOTO_NAMES = {

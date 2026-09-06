@@ -7,7 +7,7 @@ FeatureContext 传递依赖，避免到处 import 全局单例。
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from astrbot.api.event import AstrMessageEvent
@@ -16,6 +16,7 @@ from astrbot.api.star import Context
 from ..core.audit import AuditLog
 from ..core.config import StewardConfig
 from ..core.db import Database
+from ..core.fonts import FontResolver
 from ..core.group_cache import GroupInfoCache
 from ..core.permission import PermissionResolver
 from ..core.store import GroupStore
@@ -37,6 +38,15 @@ class FeatureContext:
     db: Database
     #: Markdown -> 图片 URL，由 main.py 注入（Star.text_to_image），便于单测替换
     to_image: Callable[[str], Awaitable[str]]
+    #: 字体解析器，别直接用，走下面的 fonts 属性懒加载
+    _fonts: FontResolver | None = field(default=None, repr=False)
+
+    @property
+    def fonts(self) -> FontResolver:
+        """字体解析器：卡片渲染与相册拼图共用同一份字体缓存。"""
+        if self._fonts is None:
+            self._fonts = FontResolver(self.config)
+        return self._fonts
 
 
 def resolve_targets(event: AstrMessageEvent, allow_reply: bool = True) -> list[str]:

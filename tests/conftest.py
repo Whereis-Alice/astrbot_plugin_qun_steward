@@ -72,7 +72,7 @@ _DEFAULT_SECTIONS: dict[str, dict[str, Any]] = {
         "cloud_random": True,
     },
     "fonts": {"auto_download": False},
-    "output": {"long_list_mode": "合并转发", "node_lines": 15},
+    "output": {"card_style": "自绘卡片", "long_list_mode": "合并转发", "node_lines": 15},
     "voice": {"default_character": "", "chat_type": 1},
 }
 
@@ -85,6 +85,10 @@ class FakeConfig:
 
     def __init__(self, **overrides: Any) -> None:
         self.plugin_dir: Path = PLUGIN_DIR
+        # 运行时目录：默认指向不存在的路径，测试想落盘时再用 tmp_path 覆写
+        self.data_dir: Path = Path(overrides.pop("data_dir", PLUGIN_DIR / "_test_data"))
+        self.font_dir: Path = Path(overrides.pop("font_dir", self.data_dir / "fonts"))
+        self.card_dir: Path = Path(overrides.pop("card_dir", self.data_dir / "cards"))
         self.admins_id: list[str] = [str(item) for item in overrides.pop("admins_id", [])]
         self.perms: dict[str, Any] = dict(overrides.pop("perms", {}))
         self.level_threshold: int = int(overrides.pop("level_threshold", 50))

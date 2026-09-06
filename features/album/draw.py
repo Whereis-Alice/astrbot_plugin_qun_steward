@@ -15,8 +15,8 @@ from astrbot.api import logger
 from PIL import Image, ImageDraw
 
 from ...core.config import LOG_TAG
-from .emoji_text import TextPainter
-from .fonts import FontResolver
+from ...core.emoji_text import TextPainter
+from ...core.fonts import FontResolver
 
 #: 角色 -> 徽章底色
 ROLE_COLORS = {"owner": "#fdd93f", "admin": "#3fe3d8"}

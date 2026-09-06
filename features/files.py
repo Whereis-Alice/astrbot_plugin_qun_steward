@@ -23,6 +23,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 from astrbot.core.message.components import File, Image, Reply, Video
 
+from ..core.card import Bar, Card, Note, Stat, Stats
 from ..core.config import LOG_TAG
 from ..core.protocol import as_dict, call_action
 from ..core.utils import download_file, format_datetime, format_size, sanitize_filename
@@ -477,10 +478,11 @@ class FilesFeature(Feature):
         return f"已把 📄{display} 改名为 📄{new_name}"
 
     # ------------------------------------------------------------ 容量 --- #
-    async def usage(self, event: AstrMessageEvent) -> str:
+    async def usage(self, event: AstrMessageEvent) -> str | Card:
         """群文件容量统计。"""
+        group_id = event.get_group_id()
         result = await call_action(
-            event, ("get_group_file_system_info",), group_id=int(event.get_group_id())
+            event, ("get_group_file_system_info",), group_id=int(group_id)
         )
         if not result.ok:
             return f"读取群文件容量失败：{result.error}"
@@ -490,15 +492,32 @@ class FilesFeature(Feature):
         count = int(info.get("file_count") or 0)
         limit = int(info.get("limit_count") or 0)
 
-        lines = ["【群文件容量】"]
+        card = Card(title="群文件容量", subtitle=f"群号 {group_id}", badge="群文件")
         if total > 0:
-            lines.append(f"已用 {format_size(used)} / {format_size(total)}（{used * 100 // total}%）")
+            card.add(
+                Bar(
+                    label="已用空间",
+                    ratio=used / total,
+                    value=f"{format_size(used)} / {format_size(total)}",
+                    note=f"剩余 {format_size(max(0, total - used))}",
+                )
+            )
         else:
-            lines.append(f"已用 {format_size(used)}")
-        lines.append(f"文件数 {count}" + (f" / {limit}" if limit else ""))
+            card.add(Bar(label="已用空间", ratio=0.0, value=format_size(used), note="协议端没返回总容量"))
+
+        stats = [Stat(label="文件数", value=str(count), note=f"上限 {limit}" if limit else "")]
+        if limit:
+            stats.append(
+                Stat(
+                    label="名额占用",
+                    value=f"{min(100, count * 100 // limit)}%",
+                    tone="warn" if count * 10 >= limit * 9 else "brand",
+                )
+            )
+        card.add(Stats(items=stats))
         if total > 0 and used * 10 >= total * 9:
-            lines.append("容量快满了，可以用「整理群文件」清一批旧文件")
-        return "\n".join(lines)
+            card.add(Note(text="容量快满了，可以用「整理群文件」清一批旧文件", tone="warn"))
+        return card
 
     # ------------------------------------------------------------ 整理 --- #
     @staticmethod

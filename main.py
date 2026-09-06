@@ -21,6 +21,7 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
 
 from .core.audit import AuditLog
+from .core.card import Card, CardRenderer, from_markdown
 from .core.config import LOG_TAG, StewardConfig
 from .core.db import Database
 from .core.group_cache import GroupInfoCache
@@ -96,6 +97,7 @@ class QunStewardPlugin(Star):
             to_image=self.text_to_image,
         )
         self.feature_ctx = feature_ctx
+        self.cards = CardRenderer(feature_ctx.fonts)
 
         self.moderation = ModerationFeature(feature_ctx)
         self.essence = EssenceFeature(feature_ctx)
@@ -167,23 +169,40 @@ class QunStewardPlugin(Star):
 
     # ================================================================ 公共工具
 
-    async def _rich(self, event: AstrMessageEvent, text: str) -> Any:
-        """长文本渲染成图片，短文本直接发文字；渲染失败自动回退。"""
+    async def _rich(self, event: AstrMessageEvent, payload: str | Card) -> Any:
+        """把结果渲染成卡片图；短文本直接发文字，渲染失败逐级回退。
+
+        payload 可以是 Card（功能模块自己排的版），也可以是文本 / 轻量 Markdown
+        （由 from_markdown 自动解析成卡片）。
+        """
+        card = payload if isinstance(payload, Card) else None
+        text = card.to_text() if card is not None else payload
         if not text:
             return None
-        if len(text) <= RICH_TEXT_THRESHOLD and "\n" not in text:
+        style = self.cfg.output.str("card_style", "自绘卡片")
+        if style == "纯文本":
             return event.plain_result(text)
+        if card is None and len(text) <= RICH_TEXT_THRESHOLD and "\n" not in text:
+            return event.plain_result(text)
+        if style == "自绘卡片":
+            try:
+                built = card if card is not None else from_markdown(text)
+                path = await asyncio.to_thread(self.cards.save, built, self.cfg.card_dir)
+                return event.image_result(str(path))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"{LOG_TAG} 卡片渲染失败，改用框架模板：{exc}")
         try:
             return event.image_result(await self.text_to_image(text))
         except Exception as exc:  # noqa: BLE001
             logger.warning(f"{LOG_TAG} 文本转图片失败，回退纯文本：{exc}")
             return event.plain_result(text)
 
-    async def _long(self, event: AstrMessageEvent, text: str) -> Any:
+    async def _long(self, event: AstrMessageEvent, payload: str | Card) -> Any:
         """天生很长的列表：按配置走合并转发 / 长图 / 纯文本。
 
-        合并转发的好处是不刷屏、还能复制文字；协议端不支持时自动回退成长图。
+        合并转发的好处是不刷屏、还能复制文字；协议端不支持时自动回退成图片。
         """
+        text = payload.to_text() if isinstance(payload, Card) else payload
         if not text:
             return None
         mode = self.cfg.output.str("long_list_mode", "合并转发")
@@ -193,7 +212,7 @@ class QunStewardPlugin(Star):
             blocks = split_text(text, self.cfg.output.int("node_lines", 15))
             if len(blocks) > 1 and await send_forward(event, blocks):
                 return None
-        return await self._rich(event, text)
+        return await self._rich(event, payload)
 
     @staticmethod
     def _image(picked: PickedImage) -> Comp.Image:
@@ -207,7 +226,7 @@ class QunStewardPlugin(Star):
     @filter.command("群务帮助", alias={"群管帮助"})
     async def cmd_help(self, event: AstrMessageEvent):
         """群务帮助：查看全部指令"""
-        yield event.image_result(await self.text_to_image(self.configs.help_markdown()))
+        yield await self._rich(event, self.configs.help_markdown())
 
     @filter.command("群管配置", alias={"群管设置"})
     @perm_required(PermLevel.MEMBER, perm_key="set_config", check_at=False)
@@ -638,7 +657,7 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.MEMBER, perm_key="group_info")
     async def cmd_group_info(self, event: AstrMessageEvent):
         """群信息：群等级、人数、加群方式、当前管理策略"""
-        result = await self._long(event, await self.insight.group_info(event))
+        result = await self._rich(event, await self.insight.group_info(event))
         if result:
             yield result
 
@@ -646,7 +665,7 @@ class QunStewardPlugin(Star):
     @perm_required(PermLevel.MEMBER, perm_key="group_honor")
     async def cmd_group_honor(self, event: AstrMessageEvent):
         """群荣誉：龙王、群聊之火、氛围担当等榜单"""
-        result = await self._long(event, await self.insight.honor(event))
+        result = await self._rich(event, await self.insight.honor(event))
         if result:
             yield result
 

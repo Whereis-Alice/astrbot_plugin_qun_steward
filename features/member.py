@@ -19,7 +19,7 @@ from astrbot.core.utils.session_waiter import SessionController, session_waiter
 
 from ..core.config import LOG_TAG
 from ..core.group_cache import role_label
-from ..core.utils import format_date, get_nickname, parse_int
+from ..core.utils import format_date, get_nickname, md_cell, parse_int
 from .base import Feature
 
 #: 群友信息图片最多渲染多少行，超出只出统计，避免生成超大图片
@@ -71,7 +71,7 @@ class MemberFeature(Feature):
                 f" | {parse_int(member.get('level'), 0) or 0}"
                 f" | {role_label(member.get('role'))}"
                 f" | {member.get('user_id', '')}"
-                f" | {nickname.replace('|', '/')} |"
+                f" | {md_cell(nickname, 24)} |"
             )
         if len(rows) > MAX_LIST_ROWS:
             lines.append("")
@@ -146,7 +146,7 @@ class MemberFeature(Feature):
                 f"| {format_date(member.get('last_sent_time'))}"
                 f" | {parse_int(member.get('level'), 0) or 0}"
                 f" | {member.get('user_id', '')}"
-                f" | {nickname.replace('|', '/')} |"
+                f" | {md_cell(nickname, 24)} |"
             )
         if truncated:
             lines.append("")

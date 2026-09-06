@@ -86,8 +86,11 @@ def format_datetime(timestamp: Any) -> str:
         return "未知"
 
 
-def format_duration(seconds: Any) -> str:
-    """秒数转人类可读时长，例如 3720 -> 1小时2分钟。"""
+def format_duration(seconds: Any, units: int = 0) -> str:
+    """秒数转人类可读时长，例如 3720 -> 1小时2分钟。
+
+    units 大于 0 时只保留最高的几段：列表里「2天23小时」比精确到秒好读。
+    """
     total = parse_int(seconds, 0) or 0
     if total <= 0:
         return "0秒"
@@ -96,6 +99,8 @@ def format_duration(seconds: Any) -> str:
         value, total = divmod(total, unit_seconds)
         if value:
             parts.append(f"{value}{unit_name}")
+        if units > 0 and len(parts) >= units:
+            break
     return "".join(parts)
 
 
@@ -107,6 +112,17 @@ def format_size(num_bytes: Any) -> str:
             return f"{size:.2f} {unit}" if unit != "B" else f"{int(size)} B"
         size /= 1024
     return f"{size:.2f} GB"
+
+
+def md_cell(value: Any, limit: int = 0) -> str:
+    """把任意值洗成能安全放进 Markdown 表格的单元格文本。
+
+    竖线会把一格切成两格、换行会把一行切成两行，都得先换掉；limit 大于 0 时截断。
+    """
+    text = " ".join(str(value if value not in (None, "") else "-").split()).replace("|", "/")
+    if limit > 0 and len(text) > limit:
+        text = text[: max(1, limit - 1)] + "…"
+    return text
 
 
 def sanitize_filename(name: str, fallback: str = "default") -> str:

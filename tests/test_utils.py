@@ -12,6 +12,7 @@ from astrbot_plugin_qun_steward.core.utils import (
     format_duration,
     format_size,
     list_text,
+    md_cell,
     parse_bool,
     parse_int,
     parse_time_range,
@@ -94,11 +95,41 @@ def test_format_duration(seconds: int, expected: str) -> None:
 
 
 @pytest.mark.parametrize(
+    ("seconds", "units", "expected"),
+    [
+        (255659, 2, "2天23小时"),
+        (3720, 1, "1小时"),
+        (90061, 2, "1天1小时"),
+        (90061, 9, "1天1小时1分钟1秒"),
+        (59, 2, "59秒"),
+        (86400, 1, "1天"),
+        (90061, 0, "1天1小时1分钟1秒"),
+        (0, 2, "0秒"),
+    ],
+)
+def test_format_duration_units(seconds: int, units: int, expected: str) -> None:
+    """units 只保留最高的几段，跳过为 0 的高位单位。"""
+    assert format_duration(seconds, units) == expected
+
+
+@pytest.mark.parametrize(
     ("num_bytes", "expected"),
     [(0, "0 B"), (512, "512 B"), (2048, "2.00 KB"), (1048576, "1.00 MB")],
 )
 def test_format_size(num_bytes: int, expected: str) -> None:
     assert format_size(num_bytes) == expected
+
+
+def test_md_cell() -> None:
+    assert md_cell("正常昵称") == "正常昵称"
+    assert md_cell("含|竖线") == "含/竖线"
+    assert md_cell("多行\n昵称") == "多行 昵称"
+    assert md_cell("  空白   收拢 ") == "空白 收拢"
+    assert md_cell(None) == "-"
+    assert md_cell("") == "-"
+    assert md_cell(12345) == "12345"
+    assert md_cell("一二三四五六七八九十", 5) == "一二三四…"
+    assert md_cell("一二三", 5) == "一二三"
 
 
 def test_sanitize_filename() -> None:

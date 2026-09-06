@@ -79,9 +79,16 @@ class StewardConfig:
         self.file_dir: Path = self.data_dir / "files"
         self.album_dir: Path = self.data_dir / "album"
         self.font_dir: Path = self.data_dir / "fonts"
+        self.card_dir: Path = self.data_dir / "cards"
         self.curfew_path: Path = self.data_dir / "curfew.json"
 
-        for directory in (self.notice_dir, self.file_dir, self.album_dir, self.font_dir):
+        for directory in (
+            self.notice_dir,
+            self.file_dir,
+            self.album_dir,
+            self.font_dir,
+            self.card_dir,
+        ):
             directory.mkdir(parents=True, exist_ok=True)
 
     # ----------------------------------------------------------------- raw --- #
@@ -162,10 +169,10 @@ class StewardConfig:
 
     @property
     def output(self) -> Section:
-        """长列表输出方式（合并转发 / 长图 / 纯文本）。"""
+        """回复排版：卡片风格 + 长列表输出方式。"""
         return Section(
             self._raw.get("output"),
-            {"long_list_mode": "合并转发", "node_lines": 15},
+            {"card_style": "自绘卡片", "long_list_mode": "合并转发", "node_lines": 15},
         )
 
     @property

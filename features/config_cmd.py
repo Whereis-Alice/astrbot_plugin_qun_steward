@@ -10,7 +10,7 @@ from astrbot.api.event import AstrMessageEvent
 from ..core.audit import action_label
 from ..core.config import DISPLAY_NAME
 from ..core.store import FIELD_LABELS
-from ..core.utils import format_datetime, parse_int
+from ..core.utils import format_datetime, md_cell, parse_int
 from .base import Feature, rest_of
 
 #: 操作日志单次最多展示条数
@@ -114,7 +114,7 @@ HELP_SECTIONS: tuple[tuple[str, tuple[tuple[str, str], ...]], ...] = (
         "插件自身",
         (
             ("群管配置", "不带参数导出本群配置；带「字段: 值」多行文本则写入"),
-            ("群管重置 [群号|all]", "让群回到跟随默认配置的状态"),
+            ("群管重置 [群号/all]", "让群回到跟随默认配置的状态"),
             ("操作日志 [关键词] [条数]", "查看本群的管理操作记录"),
             ("撤销", "撤销最近一次可回滚的危险操作"),
             ("群务帮助", "显示这份说明"),
@@ -212,7 +212,7 @@ class ConfigFeature(Feature):
             lines.append("| 指令 | 说明 |")
             lines.append("| --- | --- |")
             for command, description in items:
-                lines.append(f"| {command} | {description} |")
+                lines.append(f"| {md_cell(command)} | {md_cell(description)} |")
             lines.append("")
         lines.append("> 权限阈值、默认配置与更多开关可在 AstrBot 面板的插件配置或管理页里调整。")
         return "\n".join(lines)
@@ -245,9 +245,9 @@ class ConfigFeature(Feature):
                     time=format_datetime(row.get("ts")),
                     action=action_label(str(row.get("action") or "")),
                     mark=mark,
-                    operator=operator,
-                    target=row.get("target_id") or "-",
-                    detail=(str(row.get("detail") or "-")).replace("|", "/")[:60],
+                    operator=md_cell(operator, 16),
+                    target=md_cell(row.get("target_id")),
+                    detail=md_cell(row.get("detail"), 60),
                 )
             )
         return "\n".join(lines)

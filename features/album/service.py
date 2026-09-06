@@ -45,7 +45,6 @@ from ...core.utils import (
 from ..base import Feature, FeatureContext
 from .cloud import AlbumCloud, PickedImage
 from .draw import MemeRenderer, detect_image_ext
-from .fonts import FontResolver
 
 #: 支持随机发送的图片扩展名
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
@@ -71,7 +70,7 @@ class AlbumFeature(Feature):
 
     def __init__(self, ctx: FeatureContext) -> None:
         super().__init__(ctx)
-        self.fonts = FontResolver(self.config)
+        self.fonts = ctx.fonts
         self.renderer = MemeRenderer(self.fonts, self.config.resource_dir)
         self.cloud = AlbumCloud(self.config)
         # group_id -> {"album_name": str, "album_id": str}，命中后省一次列表查询

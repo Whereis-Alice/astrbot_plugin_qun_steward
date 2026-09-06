@@ -385,9 +385,20 @@
     }
   },
   "output": {
-    "description": "长列表输出",
+    "description": "回复排版",
     "type": "object",
     "items": {
+      "card_style": {
+        "description": "卡片风格",
+        "hint": "群信息、榜单、容量统计这类结果用什么方式回复。自绘卡片高度自适应、配色与插件面板统一；AstrBot 模板走框架自带的通用长图；纯文本只发文字。",
+        "type": "string",
+        "default": "自绘卡片",
+        "options": [
+          "自绘卡片",
+          "AstrBot 模板",
+          "纯文本"
+        ]
+      },
       "long_list_mode": {
         "description": "长列表发送方式",
         "hint": "审计日志、禁言列表、群友清理预览等天生很长的输出用哪种方式发。合并转发不刷屏且可复制；协议端不支持时自动回退成长图。",
@@ -447,7 +458,7 @@
     "type": "object",
     "items": {
       "set_config": {
-        "description": "群务配置 / 群务重置",
+        "description": "群管配置",
         "type": "string",
         "default": "管理员",
         "options": [
@@ -459,7 +470,7 @@
         ]
       },
       "reset_config": {
-        "description": "群务重置",
+        "description": "群管重置",
         "type": "string",
         "default": "管理员",
         "options": [
