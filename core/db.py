@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS join_request (
     nickname   TEXT NOT NULL DEFAULT '',
     comment    TEXT NOT NULL DEFAULT '',
     level      INTEGER NOT NULL DEFAULT -1,
+    sub_type   TEXT NOT NULL DEFAULT 'add',
     created_at REAL NOT NULL,
     status     TEXT NOT NULL DEFAULT 'pending',
     handled_by TEXT NOT NULL DEFAULT '',
@@ -71,6 +72,15 @@ class Database:
                 conn.row_factory = aiosqlite.Row
                 await conn.execute("PRAGMA journal_mode=WAL")
                 await conn.executescript(_SCHEMA)
+                # 旧版本已经创建过 join_request 时，CREATE TABLE IF NOT EXISTS
+                # 不会补新列。这里做一个幂等、无破坏的轻量迁移，保证升级后邀请类
+                # 申请可以记住 sub_type，而不是每次都盲猜 add / invite。
+                async with conn.execute("PRAGMA table_info(join_request)") as cursor:
+                    columns = {str(row[1]) for row in await cursor.fetchall()}
+                if "sub_type" not in columns:
+                    await conn.execute(
+                        "ALTER TABLE join_request ADD COLUMN sub_type TEXT NOT NULL DEFAULT 'add'"
+                    )
                 await conn.commit()
                 self._conn = conn
         return self._conn

@@ -17,7 +17,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..core.config import LOG_TAG
-from ..core.protocol import call_action, unwrap
+from ..core.protocol import LLBOT, SNOWLUMA, call_action, detect_backend, unwrap
 from ..core.utils import (
     apply_delta,
     format_datetime,
@@ -45,6 +45,13 @@ _IGNORED_ACTIONS: tuple[str, ...] = (
 )
 #: 一次对账最多拉多少条
 SYNC_LIMIT = 50
+
+
+class _WelcomeValues(dict[str, str]):
+    """让未认识的欢迎语占位符原样保留。"""
+
+    def __missing__(self, key: str) -> str:
+        return "{" + key + "}"
 
 
 class JoinFeature(Feature):
@@ -79,6 +86,53 @@ class JoinFeature(Feature):
                 await event.bot.send_private_msg(user_id=int(admin_id), message=text)
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"{LOG_TAG} 通知超管 {admin_id} 失败：{exc}")
+
+    @staticmethod
+    def _event_group_name(event: AstrMessageEvent, group_id: str) -> str:
+        """优先从事件原始字段取群名，避免每条新人事件都额外请求一次。"""
+        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
+        if not isinstance(raw, dict):
+            return ""
+        for key in ("group_name", "groupName", "name"):
+            value = raw.get(key)
+            if value not in (None, ""):
+                return str(value).strip()
+        group = raw.get("group")
+        if isinstance(group, dict):
+            for key in ("group_name", "groupName", "name"):
+                value = group.get(key)
+                if value not in (None, ""):
+                    return str(value).strip()
+        return ""
+
+    async def _welcome_group_name(self, event: AstrMessageEvent, group_id: str) -> str:
+        """补取群名；协议端不可用时用群号作为稳定兜底。"""
+        if name := self._event_group_name(event, group_id):
+            return name
+        getter = getattr(event.bot, "get_group_info", None)
+        if callable(getter):
+            try:
+                try:
+                    info = await getter(group_id=int(group_id), no_cache=False)
+                except TypeError:
+                    # 旧版适配器不接受 no_cache。
+                    info = await getter(group_id=int(group_id))
+                info = unwrap(info)
+                if isinstance(info, dict):
+                    for key in ("group_name", "groupName", "name"):
+                        value = info.get(key)
+                        if value not in (None, ""):
+                            return str(value).strip()
+                    for key in ("group_info", "groupInfo", "info", "data"):
+                        nested = info.get(key)
+                        if isinstance(nested, dict):
+                            for name_key in ("group_name", "groupName", "name"):
+                                value = nested.get(name_key)
+                                if value not in (None, ""):
+                                    return str(value).strip()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(f"{LOG_TAG} 获取群名失败 group={group_id}：{exc}")
+        return group_id
 
     # ------------------------------------------------------- 配置类指令 --- #
     async def toggle_review(self, event: AstrMessageEvent, mode: Any = None) -> str:
@@ -196,7 +250,11 @@ class JoinFeature(Feature):
             return "已关闭本群进群欢迎"
         await self.store.set(group_id, "join_welcome", raw)
         await self.log(event, "join_welcome", detail=raw)
-        tip = "" if "{nickname}" in raw else "\n提示：欢迎语里写 {nickname} 可自动替换为新成员昵称"
+        placeholders = ("{nickname}", "{group_name}", "{user_id}")
+        tip = "" if any(item in raw for item in placeholders) else (
+            "\n提示：可用 {nickname}（昵称）、{group_name}（群名）、"
+            "{user_id}（QQ号）占位"
+        )
         return f"本群进群欢迎语已设为：\n{raw}{tip}"
 
     async def toggle_leave_notify(self, event: AstrMessageEvent, mode: Any = None) -> str:
@@ -279,6 +337,7 @@ class JoinFeature(Feature):
         nickname: str,
         comment: str,
         level: int | None,
+        sub_type: str = "add",
     ) -> int:
         """写入/更新待办，返回群内短序号。"""
         existing = await self.db.fetch_one(
@@ -289,11 +348,12 @@ class JoinFeature(Feature):
             seq = await self._next_seq(group_id)
         await self.db.execute(
             "INSERT INTO join_request"
-            " (flag, group_id, user_id, nickname, comment, level, created_at,"
+            " (flag, group_id, user_id, nickname, comment, level, sub_type, created_at,"
             "  status, handled_by, seq)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', '', ?)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', ?)"
             " ON CONFLICT(flag) DO UPDATE SET"
             " nickname=excluded.nickname, comment=excluded.comment, level=excluded.level,"
+            " sub_type=excluded.sub_type,"
             " created_at=excluded.created_at, status='pending', handled_by='',"
             " seq=excluded.seq",
             (
@@ -303,6 +363,7 @@ class JoinFeature(Feature):
                 nickname,
                 comment,
                 -1 if level is None else int(level),
+                sub_type if sub_type in {"add", "invite"} else "add",
                 time.time(),
                 seq,
             ),
@@ -339,21 +400,38 @@ class JoinFeature(Feature):
         首选 get_group_system_msg；协议端没有这个动作时退回「被忽略的加群通知」，
         两者结构基本一致，字段名做了兼容。
         """
-        result = await call_action(
-            event,
-            _SYSTEM_MSG_ACTIONS,
-            group_id=int(group_id) if group_id else None,
-            only_pending=True,
-            count=SYNC_LIMIT,
-        )
-        if not result.ok:
-            result = await call_action(event, _IGNORED_ACTIONS)
-        if not result.ok:
-            return [], result.error or "协议端不支持查询待审进群列表"
-        items = _normalize_requests(result.data)
+        # get_group_system_msg is a strict no-argument action in NapCat and
+        # LLOneBot.  Filtering and limiting happen locally so the same request
+        # is also safe on SnowLuma (which accepts optional query parameters).
+        backend = await detect_backend(event.bot)
+        if backend == SNOWLUMA and group_id:
+            # SnowLuma exposes filtering/limit parameters; NapCat and llbot's
+            # compatible endpoint is intentionally no-argument, so only use
+            # the richer form on the implementation that documents it.
+            result = await call_action(
+                event,
+                _SYSTEM_MSG_ACTIONS,
+                group_id=int(group_id),
+                only_pending=True,
+                count=SYNC_LIMIT,
+            )
+        else:
+            result = await call_action(event, _SYSTEM_MSG_ACTIONS)
+        items: list[dict[str, Any]] = []
+        if result.ok:
+            items = _normalize_requests(result.data)
+            if group_id:
+                items = [item for item in items if item["group_id"] in ("", group_id)]
+            items = _dedupe_requests(items)[:SYNC_LIMIT]
+            return _dedupe_requests(items)[:SYNC_LIMIT], ""
+
+        fallback = await call_action(event, _IGNORED_ACTIONS)
+        if not fallback.ok:
+            return [], fallback.error or result.error or "协议端不支持查询待审进群列表"
+        items = _normalize_requests(fallback.data)
         if group_id:
             items = [item for item in items if item["group_id"] in ("", group_id)]
-        return items, ""
+        return _dedupe_requests(items)[:SYNC_LIMIT], ""
 
     async def sync_pending(
         self, event: AstrMessageEvent, group_id: str = ""
@@ -383,6 +461,7 @@ class JoinFeature(Feature):
                 nickname=item["nickname"],
                 comment=item["comment"],
                 level=None,
+                sub_type=item.get("sub_type", "add"),
             )
             added += 1
 
@@ -399,11 +478,12 @@ class JoinFeature(Feature):
     def _format_pending(self, items: list[dict[str, Any]]) -> str:
         lines = [f"待审进群申请（共 {len(items)} 条）"]
         for item in items[:MAX_PENDING_SHOWN]:
-            level = item.get("level", -1)
-            level_text = "等级隐藏" if level is None or int(level) < 0 else f"{level} 级"
+            level = parse_int(item.get("level"), -1)
+            level_text = "等级隐藏" if level is None or level < 0 else f"{level} 级"
+            subtype = "邀请" if item.get("sub_type") == "invite" else "申请"
             lines.append(
                 f"[{item['seq']}] {item['nickname']}({item['user_id']})"
-                f" · {level_text} · {format_datetime(item['created_at'])}"
+                f" · {subtype} · {level_text} · {format_datetime(item['created_at'])}"
             )
             if item.get("comment"):
                 lines.append(f"    验证信息：{item['comment']}")
@@ -423,6 +503,11 @@ class JoinFeature(Feature):
         if closed:
             notes.append(f"清掉 {closed} 条已在客户端处理过的")
         if not items:
+            if error:
+                return (
+                    "暂时无法确认协议端是否还有待审进群申请，"
+                    f"本地也没有可展示的记录：{error}"
+                )
             tail = "（" + "，".join(notes) + "）" if notes else ""
             return f"当前没有待审的进群申请{tail}"
         text = self._format_pending(items)
@@ -462,23 +547,50 @@ class JoinFeature(Feature):
         return None, tokens, self._format_pending(items)
 
     async def _send_approval(
-        self, event: AstrMessageEvent, flag: str, agree: bool, reason: str
+        self,
+        event: AstrMessageEvent,
+        flag: str,
+        agree: bool,
+        reason: str,
+        sub_type: str = "add",
     ) -> None:
         """同意/拒绝一条申请。
 
-        主动申请是 sub_type=add，别人邀请进群是 sub_type=invite。上游只发 add，
-        导致邀请类申请永远处理失败，这里在 add 失败后再按 invite 试一次。
+        主动申请是 sub_type=add，别人邀请进群是 sub_type=invite。
+
+        LLOneBot 的 ``set_group_add_request`` 是一个兼容 OneBot 名称的扩展，
+        但它的严格参数模型只有 ``flag / approve / reason``，把标准 OneBot 的
+        ``sub_type`` 一并传过去会在协议端参数校验阶段失败。这里对 llbot 走
+        原始 action 调用，其他端继续走 aiocqhttp 的标准方法。
+
+        NapCat 的旧版本偶尔会把邀请通知当成普通申请处理，因此在非 llbot
+        端保留 add / invite 两种类型的兼容重试。
         """
+        backend = await detect_backend(event.bot)
+        if backend == LLBOT:
+            result = await call_action(
+                event,
+                ("set_group_add_request",),
+                flag=flag,
+                approve=agree,
+                reason=reason,
+            )
+            if result.ok:
+                return
+            raise RuntimeError(result.error or "LLOneBot 处理进群申请失败")
+
         last: Exception | None = None
-        for sub_type in ("add", "invite"):
+        candidates = [sub_type] if sub_type in {"add", "invite"} else []
+        candidates.extend(item for item in ("add", "invite") if item not in candidates)
+        for request_type in candidates:
             try:
                 await event.bot.set_group_add_request(
-                    flag=flag, sub_type=sub_type, approve=agree, reason=reason
+                    flag=flag, sub_type=request_type, approve=agree, reason=reason
                 )
                 return
             except Exception as exc:  # noqa: BLE001 - 换另一种 sub_type 再试
                 last = exc
-                logger.debug(f"{LOG_TAG} 审批失败 flag={flag} sub_type={sub_type}: {exc}")
+                logger.debug(f"{LOG_TAG} 审批失败 flag={flag} sub_type={request_type}: {exc}")
         raise last if last else RuntimeError("处理进群申请失败")
 
     async def handle_approval(
@@ -492,6 +604,8 @@ class JoinFeature(Feature):
         if flag:
             row = await self.db.fetch_one("SELECT * FROM join_request WHERE flag = ?", (flag,))
             record = dict(row) if row else None
+            if record and str(record.get("group_id") or "") not in {"", str(group_id)}:
+                return "这条进群申请不属于当前群，拒绝处理"
         else:
             record, tokens, error = await self._pick_request(group_id, tokens)
             if record is None:
@@ -501,13 +615,24 @@ class JoinFeature(Feature):
             return "未能定位到进群申请，试试「待审进群」查看列表"
 
         reason = " ".join(tokens).strip()
-        nickname = str(record["nickname"]) if record else "该用户"
-        target_id = str(record["user_id"]) if record else ""
+        if record is None:
+            # 引用旧通知时可能只有 flag，没有经过本插件的落库流程。允许兼容
+            # 这种用法，但不会把它当成本地待办，也不会在失败时伪造已处理状态。
+            nickname = "该用户"
+            target_id = ""
+        else:
+            nickname = str(record.get("nickname") or "该用户")
+            target_id = str(record.get("user_id") or "")
         try:
-            await self._send_approval(event, flag, agree, reason)
+            await self._send_approval(
+                event,
+                flag,
+                agree,
+                reason,
+                str(record.get("sub_type") or "add") if record else "add",
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error(f"{LOG_TAG} 处理进群申请失败 flag={flag}: {exc}")
-            await self._mark_handled(flag, "expired", event.get_sender_id())
             await self.log(
                 event,
                 "join_approve" if agree else "join_reject",
@@ -546,7 +671,7 @@ class JoinFeature(Feature):
         notice_type = raw.get("notice_type")
 
         if post_type == "request" and raw.get("request_type") == "group":
-            if raw.get("sub_type") != "add":
+            if raw.get("sub_type") not in {"add", "invite"}:
                 return None
             await self._handle_join_request(event, raw, group_id, user_id)
             return None
@@ -578,8 +703,18 @@ class JoinFeature(Feature):
             if welcome:
                 nickname = await get_nickname(event, user_id)
                 try:
-                    reply = welcome.format(nickname=nickname)
-                except (KeyError, IndexError, ValueError):
+                    values = {
+                        "nickname": nickname,
+                        "group_name": (
+                            await self._welcome_group_name(event, group_id)
+                            if "{group_name}" in welcome
+                            else group_id
+                        ),
+                        "user_id": user_id,
+                    }
+
+                    reply = welcome.format_map(_WelcomeValues(values))
+                except (AttributeError, IndexError, KeyError, ValueError):
                     # 欢迎语里写了不支持的占位符，原样发出去而不是报错
                     reply = welcome
             ban_time = parse_int(self.store.value(group_id, "join_ban_time"), 0) or 0
@@ -602,8 +737,32 @@ class JoinFeature(Feature):
     ) -> None:
         if not parse_bool(self.store.value(group_id, "join_switch"), True):
             return
-        comment = str(raw.get("comment") or "")
+        comment = str(raw.get("comment") or raw.get("message") or "")
         flag = str(raw.get("flag") or "")
+        sub_type = str(raw.get("sub_type") or "add").strip().lower()
+        if sub_type not in {"add", "invite"}:
+            sub_type = "add"
+        # flag 是 OneBot 审批接口的唯一定位依据；缺失时宁可只记日志，不能
+        # 写入一条无法操作的待办，更不能把空 flag 发给协议端。
+        if not flag:
+            logger.warning(
+                f"{LOG_TAG} 收到没有 flag 的进群{('邀请' if sub_type == 'invite' else '申请')}，"
+                "已忽略，避免生成不可处理的待办"
+            )
+            return
+        if not user_id:
+            user_id = str(
+                raw.get("requester_uin")
+                or raw.get("requesterUin")
+                or raw.get("target_uin")
+                or raw.get("targetUin")
+                or raw.get("invitor_uin")
+                or raw.get("invitorUin")
+                or ""
+            ).strip()
+        if not user_id:
+            logger.warning(f"{LOG_TAG} 收到没有用户 QQ 号的进群申请 flag={flag}，已忽略")
+            return
         nickname = "未知昵称"
         level: int | None = None
         try:
@@ -627,20 +786,22 @@ class JoinFeature(Feature):
             nickname=nickname,
             comment=comment,
             level=level,
+            sub_type=sub_type,
         )
 
         auto_text = ""
         if approve is not None:
             try:
-                await event.bot.set_group_add_request(
-                    flag=flag,
-                    sub_type="add",
-                    approve=approve,
-                    reason="" if approve else reason,
+                await self._send_approval(
+                    event,
+                    flag,
+                    bool(approve),
+                    "" if approve else reason,
+                    sub_type,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"{LOG_TAG} 自动审核失败 flag={flag}: {exc}")
-                await self._mark_handled(flag, "expired", "auto")
+                # 接口失败不等于申请过期；保留 pending，让管理员稍后重试。
                 return
             await self._mark_handled(flag, "approved" if approve else "rejected", "auto")
             await self.audit.record(
@@ -660,6 +821,13 @@ class JoinFeature(Feature):
         lines.append(f"昵称：{nickname}")
         lines.append(f"QQ：{user_id}")
         lines.append(f"flag：{flag}")
+        if sub_type == "invite":
+            invitor = str(raw.get("invitor_uin") or raw.get("invitorUin") or "").strip()
+            if invitor and invitor != user_id:
+                invitor_nick = str(
+                    raw.get("invitor_nick") or raw.get("invitorNick") or invitor
+                ).strip()
+                lines.append(f"邀请人：{invitor_nick}({invitor})")
         if level is not None:
             lines.append(f"等级：{level}")
         if comment:
@@ -695,17 +863,11 @@ def _normalize_requests(payload: Any) -> list[dict[str, Any]]:
     已经处理过（checked=true）的条目会被丢掉。
     """
     raw = unwrap(payload)
-    entries: list[Any] = []
-    if isinstance(raw, list):
-        entries = raw
-    elif isinstance(raw, dict):
-        for value in raw.values():
-            if isinstance(value, list):
-                entries.extend(value)
+    entries = _request_entries(raw)
 
     items: list[dict[str, Any]] = []
     for entry in entries:
-        if not isinstance(entry, dict) or entry.get("checked"):
+        if not isinstance(entry, dict) or _request_is_checked(entry):
             continue
         flag = str(
             entry.get("flag")
@@ -716,21 +878,34 @@ def _normalize_requests(payload: Any) -> list[dict[str, Any]]:
         ).strip()
         user_id = str(
             entry.get("requester_uin")
-            or entry.get("user_id")
             or entry.get("requesterUin")
+            or entry.get("user_id")
+            or entry.get("userId")
             or entry.get("uin")
+            or entry.get("target_uin")
+            or entry.get("targetUin")
+            or entry.get("invitor_uin")
+            or entry.get("invitorUin")
             or ""
         ).strip()
         if not flag or not user_id:
             continue
         nickname = str(
             entry.get("requester_nick")
-            or entry.get("nickname")
             or entry.get("requesterNick")
+            or entry.get("nickname")
+            or entry.get("nick")
             or ""
         ).strip()
-        comment = str(entry.get("message") or entry.get("comment") or "").strip()
-        invitor = str(entry.get("invitor_uin") or entry.get("invitorUin") or "").strip()
+        comment = str(
+            entry.get("message")
+            or entry.get("comment")
+            or entry.get("reason")
+            or ""
+        ).strip()
+        invitor = str(
+            entry.get("invitor_uin") or entry.get("invitorUin") or ""
+        ).strip()
         if invitor and invitor != "0":
             invitor_nick = str(entry.get("invitor_nick") or "").strip() or invitor
             comment = f"由 {invitor_nick} 邀请入群" + (f"｜{comment}" if comment else "")
@@ -741,6 +916,138 @@ def _normalize_requests(payload: Any) -> list[dict[str, Any]]:
                 "user_id": user_id,
                 "nickname": nickname or user_id,
                 "comment": comment,
+                "sub_type": _request_sub_type(entry, invitor),
             }
         )
-    return items
+    return _dedupe_requests(items)
+
+
+def _request_sub_type(entry: dict[str, Any], invitor: str = "") -> str:
+    """归一化申请类型；老协议缺少 sub_type 时按邀请人字段推断。"""
+    value = str(entry.get("sub_type") or entry.get("subType") or "").strip().lower()
+    if value in {"add", "invite"}:
+        return value
+    if invitor and invitor != "0":
+        requester = str(
+            entry.get("requester_uin")
+            or entry.get("requesterUin")
+            or entry.get("requester_id")
+            or entry.get("requesterId")
+            or ""
+        ).strip()
+        if not requester:
+            return "invite"
+    return "add"
+
+
+_REQUEST_FLAG_KEYS = frozenset(
+    {"flag", "request_id", "requestId", "request_seq", "requestSeq", "seq"}
+)
+_REQUEST_USER_KEYS = frozenset(
+    {
+        "requester_uin",
+        "requesterUin",
+        "user_id",
+        "userId",
+        "uin",
+        "target_uin",
+        "targetUin",
+        "invitor_uin",
+        "invitorUin",
+    }
+)
+_REQUEST_CONTAINER_KEYS = frozenset(
+    {
+        "data",
+        "result",
+        "payload",
+        "response",
+        "requests",
+        "join_requests",
+        "joinRequests",
+        "InvitedRequest",
+        "invited_requests",
+        "items",
+        "list",
+        "messages",
+    }
+)
+
+
+def _request_is_entry(value: dict[str, Any]) -> bool:
+    """判断一个字典是否像申请条目，而不是响应包装。"""
+    keys = set(value)
+    has_flag = bool(keys & _REQUEST_FLAG_KEYS)
+    has_user = bool(keys & _REQUEST_USER_KEYS)
+    has_context = bool(
+        keys
+        & {
+            "requester_nick",
+            "requesterNick",
+            "nickname",
+            "nick",
+            "message",
+            "comment",
+            "checked",
+            "is_checked",
+            "isChecked",
+            "invitor_uin",
+            "invitorUin",
+            "invitor_nick",
+            "invitorNick",
+        }
+    )
+    return (has_flag and has_user) or (has_flag and has_context)
+
+
+def _request_is_checked(entry: dict[str, Any]) -> bool:
+    """只把明确的 true / 1 视为已处理，避免 ``"false"`` 被当成真值。"""
+    for key in ("checked", "is_checked", "isChecked"):
+        if key in entry:
+            return parse_bool(entry.get(key), default=None) is True
+    return False
+
+
+def _request_entries(value: Any, *, _depth: int = 0, _seen: set[int] | None = None) -> list[Any]:
+    """递归寻找申请条目，兼容 data/result/payload 多层包装。"""
+    if _depth > 8 or value is None:
+        return []
+    seen = _seen if _seen is not None else set()
+    if isinstance(value, (dict, list)):
+        marker = id(value)
+        if marker in seen:
+            return []
+        seen.add(marker)
+    if isinstance(value, list):
+        result: list[Any] = []
+        for item in value:
+            result.extend(_request_entries(item, _depth=_depth + 1, _seen=seen))
+        return result
+    if not isinstance(value, dict):
+        return []
+    if _request_is_entry(value):
+        return [value]
+
+    result = []
+    # 先走已知容器，保证常见响应的顺序稳定。
+    preferred = [key for key in value if key in _REQUEST_CONTAINER_KEYS]
+    preferred.extend(key for key in value if key not in _REQUEST_CONTAINER_KEYS)
+    for key in preferred:
+        nested = value.get(key)
+        if isinstance(nested, (dict, list)):
+            result.extend(_request_entries(nested, _depth=_depth + 1, _seen=seen))
+    return result
+
+
+def _dedupe_requests(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """合并多个收件箱来源时按 flag 去重；无 flag 的条目保留一次。"""
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in items:
+        flag = str(item.get("flag") or "")
+        if flag and flag in seen:
+            continue
+        if flag:
+            seen.add(flag)
+        result.append(item)
+    return result

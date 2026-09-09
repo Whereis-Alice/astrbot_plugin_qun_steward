@@ -5,7 +5,7 @@
 - 引用/附带图片 -> 直接使用原图
 - 末尾带数量 -> 把被引用消息往上的 N 条文本拼成长图
 
-上传成功后可选把图片留档到本地，供「随机图关键词」二次使用。
+上传成功后可选把图片留档到本地，作为协议端相册读取失败时的离线兜底。
 """
 
 from __future__ import annotations
@@ -554,14 +554,22 @@ class AlbumFeature(Feature):
     async def pick_image(
         self, event: AstrMessageEvent, group_id: str, album_id: str
     ) -> PickedImage | None:
-        """随机取一张图：本地留档优先（快且省流量），没有就走云端相册。"""
+        """随机取一张图：云端优先，本地留档只作为可选离线兜底。
+
+        云端优先可以看到别人刚上传的图片，也确保关闭本地备份后功能仍然
+        可用；只有云端未开启、接口不可用或没有可用图片时才读取本地留档。
+        """
+        if self.cloud.enabled:
+            try:
+                url = await self.cloud.random_url(event, group_id, album_id)
+            except Exception as exc:  # noqa: BLE001 - 本地留档仍可继续兜底
+                logger.debug(f"{LOG_TAG} 云端随机取图失败，尝试本地留档：{exc}")
+                url = ""
+            if url:
+                return PickedImage(url=url)
+
         local = self.random_image(group_id, album_id)
-        if local is not None:
-            return PickedImage(path=local)
-        if not self.cloud.enabled:
-            return None
-        url = await self.cloud.random_url(event, group_id, album_id)
-        return PickedImage(url=url) if url else None
+        return PickedImage(path=local) if local is not None else None
 
     async def random_keyword(self, event: AstrMessageEvent) -> PickedImage | None:
         """被动监听入口：命中相册名则返回一张随机图。"""

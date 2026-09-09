@@ -13,9 +13,10 @@ import pytest
 from astrbot_plugin_qun_steward.core import protocol
 from astrbot_plugin_qun_steward.features.album import cloud as cloud_mod
 from astrbot_plugin_qun_steward.features.album.cloud import AlbumCloud, PickedImage
+from astrbot_plugin_qun_steward.features.album.service import AlbumFeature
 from astrbot_plugin_qun_steward.features.base import FeatureContext
 from astrbot_plugin_qun_steward.features.files import FilesFeature
-from astrbot_plugin_qun_steward.features.join import _normalize_requests
+from astrbot_plugin_qun_steward.features.join import _normalize_requests, _WelcomeValues
 from astrbot_plugin_qun_steward.features.voice import VoiceFeature, _flatten_characters
 
 GID = "10001"
@@ -87,7 +88,14 @@ class TestNormalizeRequests:
         payload = [{"requestId": "f3", "requesterUin": "3", "requesterNick": "丙"}]
         items = _normalize_requests(payload)
         assert items == [
-            {"flag": "f3", "group_id": "", "user_id": "3", "nickname": "丙", "comment": ""}
+            {
+                "flag": "f3",
+                "group_id": "",
+                "user_id": "3",
+                "nickname": "丙",
+                "comment": "",
+                "sub_type": "add",
+            }
         ]
 
     def test_onebot_wrapper_is_unwrapped(self) -> None:
@@ -120,6 +128,28 @@ class TestNormalizeRequests:
             [{"flag": "fa", "user_id": "10", "invitor_uin": "0", "message": "你好"}]
         )
         assert items[0]["comment"] == "你好"
+
+    def test_string_false_checked_entry_is_kept(self) -> None:
+        payload = [
+            {"flag": "f-false", "user_id": "10", "checked": "false"},
+            {"flag": "f-true", "user_id": "11", "checked": "true"},
+        ]
+        assert [item["flag"] for item in _normalize_requests(payload)] == ["f-false"]
+
+    def test_nested_wrappers_are_scanned_without_duplicates(self) -> None:
+        entry = {"flag": "nested", "userId": "12", "requesterNick": "嵌套"}
+        payload = {"data": {"result": {"joinRequests": [entry], "items": [entry]}}}
+        items = _normalize_requests(payload)
+        assert len(items) == 1
+        assert items[0]["user_id"] == "12"
+
+
+def test_unknown_welcome_placeholders_are_preserved() -> None:
+    values = _WelcomeValues(
+        nickname="小明", group_name="测试群", user_id="12345"
+    )
+    assert "小明" in "{nickname} 欢迎加入 {group_name}（{user_id}）".format_map(values)
+    assert "{future}" in "{future}".format_map(values)
 
 
 # --------------------------------------------------------------- AI 声聊
@@ -494,3 +524,41 @@ class TestAlbumCloud:
         assert await album.album_id_of(None, GID, "摸鱼") == "1"
         assert await album.album_id_of(None, GID, "不存在") == ""
         assert await album.album_id_of(None, GID, "  ") == ""
+
+
+class TestAlbumPickImage:
+    async def test_cloud_image_is_preferred_over_local_backup(self, tmp_path: Any) -> None:
+        # 只装配 pick_image 需要的两个依赖，避免启动真实协议端。
+        feature = AlbumFeature.__new__(AlbumFeature)
+
+        async def cloud_url(*_args: Any) -> str:
+            return "https://example.com/cloud.png"
+
+        feature.cloud = SimpleNamespace(
+            enabled=True,
+            random_url=cloud_url,
+        )
+        local = tmp_path / "local.png"
+        local.write_bytes(b"local")
+        feature.random_image = lambda *_args: local
+
+        picked = await feature.pick_image(None, GID, "a1")
+        assert picked is not None
+        assert picked.url == "https://example.com/cloud.png"
+        assert picked.path is None
+
+    async def test_local_backup_is_fallback_when_cloud_read_fails(self, tmp_path: Any) -> None:
+        feature = AlbumFeature.__new__(AlbumFeature)
+
+        async def cloud_url(*_args: Any) -> str:
+            raise RuntimeError("cloud unavailable")
+
+        feature.cloud = SimpleNamespace(enabled=True, random_url=cloud_url)
+        local = tmp_path / "local.png"
+        local.write_bytes(b"local")
+        feature.random_image = lambda *_args: local
+
+        picked = await feature.pick_image(None, GID, "a1")
+        assert picked is not None
+        assert picked.path == local
+        assert picked.url == ""

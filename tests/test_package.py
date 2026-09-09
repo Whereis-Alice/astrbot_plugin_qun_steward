@@ -10,7 +10,7 @@ from typing import Any
 
 import pytest
 import yaml
-from astrbot_plugin_qun_steward.core.config import DISPLAY_NAME, PLUGIN_NAME
+from astrbot_plugin_qun_steward.core.config import DISPLAY_NAME, PLUGIN_NAME, StewardConfig
 from astrbot_plugin_qun_steward.core.permission import PERM_OPTIONS
 from astrbot_plugin_qun_steward.core.store import FIELD_LABELS
 
@@ -118,6 +118,13 @@ class TestConfSchema:
             assert meta["default"] in PERM_OPTIONS, f"{key} 默认权限非法：{meta['default']}"
             assert meta.get("options") == PERM_OPTIONS, f"{key} 缺少或错误的 options"
 
+    def test_vote_permissions_are_split(self, schema: dict[str, Any]) -> None:
+        perms = schema["perms"]["items"]
+        assert perms["vote_start"]["default"] == "管理员"
+        assert perms["vote"]["default"] == "成员"
+        assert "发起" in perms["vote_start"]["description"]
+        assert "参与" in perms["vote"]["description"]
+
     def test_top_level_keys_are_stable(self, schema: dict[str, Any]) -> None:
         # admins_id / timezone 来自 AstrBot 全局配置，不在插件模板里重复声明。
         assert set(schema) == {
@@ -141,6 +148,23 @@ class TestConfSchema:
         for key in ("admin_audit", "random_ban_time", "level_threshold", "enable_llm_tools"):
             assert "default" in schema[key], f"{key} 缺少默认值"
             assert schema[key].get("description"), f"{key} 缺少说明"
+
+    def test_llm_tools_are_off_by_default(self, schema: dict[str, Any]) -> None:
+        """危险的模型管理工具必须由管理员显式开启。"""
+        assert schema["enable_llm_tools"]["default"] is False
+
+        config = object.__new__(StewardConfig)
+        config._raw = {}  # type: ignore[attr-defined]
+        assert config.enable_llm_tools is False
+
+        config._raw = {"enable_llm_tools": True}  # type: ignore[attr-defined]
+        assert config.enable_llm_tools is True
+
+        config._raw = {"enable_llm_tools": "false"}  # type: ignore[attr-defined]
+        assert config.enable_llm_tools is False
+
+        config._raw = {"enable_llm_tools": "unexpected"}  # type: ignore[attr-defined]
+        assert config.enable_llm_tools is False
 
     def test_sections_are_objects(self, schema: dict[str, Any]) -> None:
         for key in (

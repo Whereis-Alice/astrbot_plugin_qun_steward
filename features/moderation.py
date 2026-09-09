@@ -9,12 +9,21 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..core.config import LOG_TAG
-from ..core.protocol import as_dict, call_action
-from ..core.utils import extract_image_url, format_duration, get_nickname
+from ..core.protocol import (
+    LLBOT,
+    as_dict,
+    call_action,
+    detect_backend,
+    explain_action_error,
+    is_unsupported_error,
+)
+from ..core.utils import extract_image_url, format_duration, get_nickname, parse_bool, parse_int
 from .base import Feature, resolve_targets, rest_of
 
-#: 批量踢人（一次请求踢多人），协议端不支持时回退成逐个踢
-_KICK_BATCH_ACTIONS: tuple[str, ...] = ("set_group_kick_members",)
+#: NapCat / SnowLuma 的批量踢人动作
+_KICK_BATCH_ACTION = "set_group_kick_members"
+#: LLOneBot 的批量踢人动作（参数名也与 NapCat 不同）
+_LLBOT_KICK_BATCH_ACTION = "batch_delete_group_member"
 
 #: 查询 @全体成员 的剩余次数
 _AT_ALL_REMAIN_ACTIONS: tuple[str, ...] = ("get_group_at_all_remain",)
@@ -235,12 +244,14 @@ class ModerationFeature(Feature):
 
         action = "block" if reject else "kick"
         # 多人时优先用协议端的批量接口，只发一次请求，风控概率更低
-        if len(targets) > 1 and (
-            batched := await self._kick_batch(event, group_id, targets, reject, action)
-        ):
-            if truncated:
-                batched += f"\n（一次最多操作 {max_batch} 人，其余已忽略）"
-            return batched
+        if len(targets) > 1:
+            attempted, batched = await self._kick_batch(
+                event, group_id, targets, reject, action
+            )
+            if attempted:
+                if truncated:
+                    batched += f"\n（一次最多操作 {max_batch} 人，其余已忽略）"
+                return batched
 
         results: list[str] = []
         for index, tid in enumerate(targets):
@@ -271,28 +282,50 @@ class ModerationFeature(Feature):
         targets: list[str],
         reject: bool,
         action: str,
-    ) -> str:
-        """尝试批量踢人接口；协议端不支持或调用失败时返回空串，交由调用方逐个踢。"""
+    ) -> tuple[bool, str]:
+        """尝试批量踢人。
+
+        只有明确的“不支持”才回退逐个踢；权限错误、参数错误或部分失败
+        不再次重试，避免把已经成功处理的成员重复操作一遍。
+        """
+        # llbot 的批量接口没有 reject_add_request / 黑名单语义；群拉黑必须
+        # 逐个调用 set_group_kick，不能把参数错误地塞给批量动作。
+        if reject:
+            return False, ""
         try:
             user_ids = [int(tid) for tid in targets]
         except (TypeError, ValueError):
-            return ""
+            return False, ""
+
+        backend = await detect_backend(event.bot)
+        if backend == LLBOT:
+            action_name = _LLBOT_KICK_BATCH_ACTION
+            params = {"group_id": int(group_id), "user_ids": user_ids}
+        else:
+            action_name = _KICK_BATCH_ACTION
+            params = {
+                "group_id": int(group_id),
+                "user_id": user_ids,
+                "reject_add_request": False,
+            }
 
         result = await call_action(
             event,
-            _KICK_BATCH_ACTIONS,
-            group_id=int(group_id),
-            user_id=user_ids,
-            reject_add_request=reject,
+            (action_name,),
+            **params,
         )
         if not result.ok:
-            logger.debug(f"{LOG_TAG} 批量踢人不可用，回退逐个处理：{result.error}")
-            return ""
+            if is_unsupported_error(result.error):
+                logger.debug(f"{LOG_TAG} 批量踢人不可用，回退逐个处理：{result.error}")
+                return False, ""
+            detail = result.error or "协议端未返回明确结果"
+            await self.log(event, action, detail=detail, success=False)
+            return True, f"批量操作失败：{detail}"
 
         for tid in targets:
             await self.log(event, action, target_id=tid, detail="批量操作")
         verb = "踢出本群并拉黑" if reject else "踢出本群"
-        return f"已将 {len(targets)} 人{verb}：" + "、".join(targets)
+        return True, f"已将 {len(targets)} 人{verb}：" + "、".join(targets)
 
     # ------------------------------------------------------------ 全体成员 --- #
     async def at_all(self, event: AstrMessageEvent, message: str = "") -> str:
@@ -308,16 +341,53 @@ class ModerationFeature(Feature):
         if not text:
             return "未指定要通知的内容"
 
-        remain = as_dict(
-            (await call_action(event, _AT_ALL_REMAIN_ACTIONS, group_id=int(group_id))).data
+        remain_result = await call_action(
+            event, _AT_ALL_REMAIN_ACTIONS, group_id=int(group_id)
         )
-        group_left = remain.get("remain_at_all_count_for_group")
-        self_left = remain.get("remain_at_all_count_for_uin")
-        if remain.get("can_at_all") is False:
+        if not remain_result.ok:
+            await self.log(
+                event,
+                "at_all",
+                detail=remain_result.error,
+                success=False,
+            )
+            return (
+                "发送 @全体成员 前查询剩余次数失败，为安全起见未发送："
+                + explain_action_error(remain_result, "@全体成员次数")
+            )
+
+        remain = as_dict(remain_result.data)
+        for key in ("remain", "at_all_remain", "atAllRemain", "data", "result"):
+            nested = remain.get(key)
+            if isinstance(nested, dict):
+                remain = nested
+                break
+
+        can_at_all = parse_bool(
+            remain.get("can_at_all")
+            if "can_at_all" in remain
+            else remain.get("canAtAll"),
+            default=None,
+        )
+        group_left = parse_int(
+            remain.get("remain_at_all_count_for_group")
+            if "remain_at_all_count_for_group" in remain
+            else remain.get("remainAtAllCountForGroup"),
+            None,
+        )
+        self_left = parse_int(
+            remain.get("remain_at_all_count_for_uin")
+            if "remain_at_all_count_for_uin" in remain
+            else remain.get("remainAtAllCountForUin"),
+            None,
+        )
+        if not remain or (group_left is None and self_left is None):
+            return "协议端没有返回可确认的 @全体成员剩余次数，为安全起见未发送"
+        if can_at_all is False:
             return "当前账号无法 @全体成员（通常是没有管理员权限）"
-        if isinstance(group_left, int) and group_left <= 0:
+        if group_left is not None and group_left <= 0:
             return "本群今日的 @全体成员次数已用完，明天再试"
-        if isinstance(self_left, int) and self_left <= 0:
+        if self_left is not None and self_left <= 0:
             return "本账号今日的 @全体成员次数已用完，明天再试"
 
         result = await call_action(
@@ -334,8 +404,10 @@ class ModerationFeature(Feature):
             return f"发送失败：{result.error}"
 
         await self.log(event, "at_all", detail=text[:60])
-        if isinstance(group_left, int):
+        if group_left is not None:
             return f"已发送 @全体成员（本群今日还剩 {max(group_left - 1, 0)} 次）"
+        if self_left is not None:
+            return f"已发送 @全体成员（本账号今日还剩 {max(self_left - 1, 0)} 次）"
         return "已发送 @全体成员"
 
     # -------------------------------------------------------------- 管理员 --- #

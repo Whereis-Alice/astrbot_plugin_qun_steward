@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from astrbot.core.message.components import Plain, Reply
+from astrbot_plugin_qun_steward.core.protocol import clear_backend_cache
 from astrbot_plugin_qun_steward.core.store import GroupStore
 from astrbot_plugin_qun_steward.features.base import FeatureContext
 from astrbot_plugin_qun_steward.features.join import JoinFeature
@@ -34,6 +37,13 @@ async def join(store: GroupStore, database: Any, make_config: ConfigFactory) -> 
         to_image=_to_image,
     )
     return JoinFeature(ctx)
+
+
+@pytest.fixture(autouse=True)
+def _clear_protocol_cache() -> Any:
+    clear_backend_cache()
+    yield
+    clear_backend_cache()
 
 
 class TestShouldApprove:
@@ -146,3 +156,166 @@ class TestShouldApprove:
         second, second_reason = await join.should_approve("30003", UID, comment="a")
         assert second is False
         assert "次数达上限" in second_reason
+
+
+class _ProtocolApi:
+    def __init__(self, app_name: str, responses: dict[str, Any] | None = None) -> None:
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+        self.responses = {"get_version_info": {"data": {"app_name": app_name}}}
+        self.responses.update(responses or {})
+
+    async def call_action(self, action: str, **kwargs: Any) -> Any:
+        self.calls.append((action, kwargs))
+        response = self.responses.get(action)
+        if isinstance(response, BaseException):
+            raise response
+        if callable(response):
+            return response(kwargs)
+        if response is None:
+            raise RuntimeError(f"unknown action {action}")
+        return response
+
+
+class _JoinEvent:
+    def __init__(
+        self,
+        api: _ProtocolApi,
+        *,
+        group_id: str = GID,
+        raw_message: dict[str, Any] | None = None,
+        reply: Reply | None = None,
+    ) -> None:
+        self.bot = SimpleNamespace(api=api)
+        self.message_obj = SimpleNamespace(raw_message=raw_message, message=[])
+        self._group_id = group_id
+        self._reply = reply
+        self.approvals: list[dict[str, Any]] = []
+
+        async def stranger_info(**_kwargs: Any) -> dict[str, Any]:
+            return {"nickname": "申请人", "qqLevel": 20}
+
+        async def set_group_add_request(**kwargs: Any) -> None:
+            self.approvals.append(kwargs)
+
+        self.bot.get_stranger_info = stranger_info
+        self.bot.set_group_add_request = set_group_add_request
+
+    def get_group_id(self) -> str:
+        return self._group_id
+
+    def get_sender_id(self) -> str:
+        return "90009"
+
+    def get_messages(self) -> list[Any]:
+        return [self._reply] if self._reply else []
+
+
+def _ok(data: Any = None) -> dict[str, Any]:
+    return {"status": "ok", "retcode": 0, "data": data}
+
+
+class TestJoinProtocolSafety:
+    async def test_llbot_approval_does_not_send_sub_type(self, join: JoinFeature) -> None:
+        api = _ProtocolApi("LLOneBot", {"set_group_add_request": _ok({})})
+        event = _JoinEvent(api)
+
+        await join._send_approval(event, "flag-ll", True, "", "invite")
+
+        calls = [item for item in api.calls if item[0] == "set_group_add_request"]
+        assert calls == [("set_group_add_request", {"flag": "flag-ll", "approve": True, "reason": ""})]
+        assert not event.approvals
+
+    async def test_napcat_invite_is_tried_before_add(self, join: JoinFeature) -> None:
+        attempts: list[str] = []
+        api = _ProtocolApi("NapCat")
+        event = _JoinEvent(api)
+
+        async def approval(**kwargs: Any) -> None:
+            attempts.append(str(kwargs["sub_type"]))
+            if kwargs["sub_type"] == "invite":
+                raise RuntimeError("旧端需要 add")
+
+        event.bot.set_group_add_request = approval
+        await join._send_approval(event, "flag-nap", True, "", "invite")
+
+        assert attempts == ["invite", "add"]
+
+    async def test_empty_flag_is_not_saved_or_approved(self, join: JoinFeature, database: Any) -> None:
+        api = _ProtocolApi("NapCat")
+        event = _JoinEvent(
+            api,
+            raw_message={
+                "post_type": "request",
+                "request_type": "group",
+                "sub_type": "add",
+                "group_id": int(GID),
+                "user_id": int(UID),
+                "flag": "",
+            },
+        )
+
+        await join.event_monitoring(event)
+
+        assert await join.pending(GID) == []
+        assert event.approvals == []
+        assert [name for name, _ in api.calls] == []
+
+    async def test_remote_failure_keeps_local_pending_request(
+        self, join: JoinFeature, database: Any
+    ) -> None:
+        await join._save_request(
+            group_id=GID,
+            user_id=UID,
+            flag="local-pending",
+            nickname="本地申请",
+            comment="hello",
+            level=None,
+        )
+        api = _ProtocolApi(
+            "NapCat",
+            {
+                "get_group_system_msg": {"status": "failed", "message": "暂时不可用"},
+                "get_group_ignored_notifies": {
+                    "status": "failed",
+                    "message": "暂时不可用",
+                },
+                "get_group_ignore_add_request": {
+                    "status": "failed",
+                    "message": "暂时不可用",
+                },
+            },
+        )
+        event = _JoinEvent(api)
+
+        added, closed, error = await join.sync_pending(event, GID)
+
+        assert added == 0
+        assert closed == 0
+        assert error == "暂时不可用"
+        rows = await join.pending(GID)
+        assert len(rows) == 1
+        assert rows[0]["flag"] == "local-pending"
+        assert rows[0]["status"] == "pending"
+
+    async def test_cross_group_reply_is_rejected_before_protocol_call(
+        self, join: JoinFeature
+    ) -> None:
+        await join._save_request(
+            group_id="other-group",
+            user_id=UID,
+            flag="foreign-flag",
+            nickname="别群用户",
+            comment="",
+            level=None,
+        )
+        reply = Reply(
+            id="notice-1",
+            chain=[Plain("【进群申请】\nflag：foreign-flag")],
+        )
+        api = _ProtocolApi("NapCat")
+        event = _JoinEvent(api, reply=reply)
+
+        result = await join.handle_approval(event, True)
+
+        assert result == "这条进群申请不属于当前群，拒绝处理"
+        assert [name for name, _ in api.calls] == []

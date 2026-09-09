@@ -304,13 +304,13 @@
       },
       "backup_media": {
         "description": "本地备份上传的图片",
-        "hint": "开启后图片会保留在插件数据目录，供关键词随机发图使用。",
+        "hint": "开启后图片会保留在插件数据目录；云端相册暂时读不到时，可作为随机发图的离线兜底。",
         "type": "bool",
         "default": false
       },
       "random_album_groups": {
         "description": "启用相册关键词随机发图的群",
-        "hint": "在这些群里 @机器人 + 相册名，会从本地备份中随机发一张。需要先开启「本地备份」。",
+        "hint": "在这些群里 @机器人 + 相册名，会从 QQ 云端相册随机发一张；云端接口不可用时才尝试本地备份。无需开启「本地备份」也能使用。",
         "type": "list",
         "default": []
       },
@@ -450,7 +450,7 @@
     "description": "开放管理能力给大模型",
     "hint": "关闭后大模型无法调用禁言/踢人等工具，只有人工指令可用。",
     "type": "bool",
-    "default": true
+    "default": false
   },
   "perms": {
     "description": "指令权限",
@@ -721,8 +721,22 @@
           "成员"
         ]
       },
+      "vote_start": {
+        "description": "投票禁言（发起投票）",
+        "hint": "只控制谁能发起一场投票；群友表态的权限由下一项单独控制。",
+        "type": "string",
+        "default": "管理员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
       "vote": {
-        "description": "投票禁言 / 赞同禁言 / 反对禁言",
+        "description": "赞同禁言 / 反对禁言（参与投票）",
+        "hint": "默认开放给全体群成员；贴表情计票也遵循群成员参与的设计。",
         "type": "string",
         "default": "成员",
         "options": [
@@ -829,6 +843,18 @@
           "成员"
         ]
       },
+      "group_policy": {
+        "description": "群管理策略（加群 / 搜索 / 邀请 / 新成员历史）",
+        "type": "string",
+        "default": "管理员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
       "group_honor": {
         "description": "群荣誉（龙王 / 群榜单）",
         "type": "string",
@@ -845,6 +871,18 @@
         "description": "禁言列表",
         "type": "string",
         "default": "成员",
+        "options": [
+          "超管",
+          "群主",
+          "管理员",
+          "高等级成员",
+          "成员"
+        ]
+      },
+      "group_todo": {
+        "description": "群待办（查看 / 设置 / 完成 / 取消）",
+        "type": "string",
+        "default": "管理员",
         "options": [
           "超管",
           "群主",
@@ -878,7 +916,7 @@
         ]
       },
       "manage_group_file": {
-        "description": "管理群文件（移动 / 改名 / 整理）",
+        "description": "管理群文件（移动 / 改名 / 整理 / 文件夹操作）",
         "type": "string",
         "default": "管理员",
         "options": [

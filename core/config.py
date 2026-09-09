@@ -12,7 +12,7 @@ from typing import Any
 
 from astrbot.api.star import Context, StarTools
 
-from .utils import parse_int, parse_time_range
+from .utils import parse_bool, parse_int, parse_time_range
 
 PLUGIN_NAME = "astrbot_plugin_qun_steward"
 DISPLAY_NAME = "群务管家"
@@ -127,7 +127,8 @@ class StewardConfig:
 
     @property
     def enable_llm_tools(self) -> bool:
-        return bool(self._raw.get("enable_llm_tools", True))
+        # 管理类工具默认关闭；只有管理员明确打开后，模型才可能触发危险动作。
+        return parse_bool(self._raw.get("enable_llm_tools"), default=False) is True
 
     @property
     def vote_ban(self) -> Section:

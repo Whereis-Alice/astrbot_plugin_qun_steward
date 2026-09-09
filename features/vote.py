@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -41,10 +42,17 @@ class VoteRecord:
     threshold: int
     expire_at: float
     votes: dict[str, bool] = field(default_factory=dict)
+    #: 指令票和表情票分开保存。这样取消表情后可以准确移除表情票，
+    #: 同时不影响「两者都行」模式下同一用户已经发出的指令票。
+    command_votes: dict[str, bool] = field(default_factory=dict, repr=False)
+    emoji_votes: dict[str, bool] = field(default_factory=dict, repr=False)
     #: 投票公告的消息 ID，贴表情计票时才有
     message_id: str = ""
     task: asyncio.Task[None] | None = None
     poll: asyncio.Task[None] | None = None
+    #: 结算只允许成功认领一次；轮询与超时任务可能同时醒来。
+    settle_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    settled: bool = False
 
     @property
     def agree(self) -> int:
@@ -61,6 +69,17 @@ class VoteFeature(Feature):
     def __init__(self, ctx: FeatureContext) -> None:
         super().__init__(ctx)
         self._votes: dict[str, VoteRecord] = {}
+        # 投票任务不是由 main.py 的通用任务集合创建的：一场投票可能在任意
+        # 群消息处理器里启动。因此这里单独持有所有任务，卸载时即使任务已经
+        # 从 _votes 里移除、正在执行最后一段网络调用，也能被统一等待/取消。
+        self._tasks: set[asyncio.Task[Any]] = set()
+
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """创建并追踪一条投票后台任务。"""
+        task = asyncio.create_task(coro)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
 
     # ------------------------------------------------------------ 配置读取
 
@@ -118,7 +137,7 @@ class VoteFeature(Feature):
         )
 
         self._votes[group_id] = record
-        record.task = asyncio.create_task(self._settle_later(event, record, ttl))
+        record.task = self._spawn(self._settle_later(event, record, ttl))
 
         emoji_ready = False
         if self._mode != MODE_COMMAND:
@@ -128,16 +147,26 @@ class VoteFeature(Feature):
         if emoji_ready:
             # 公告已经由 _setup_emoji_vote 自己发出去了，避免重复播报
             return ""
+        if self._mode == MODE_EMOJI:
+            # 严格表情模式不能悄悄改成指令计票；清理刚创建的超时任务，
+            # 把失败原因直接交给发起人。
+            self._finish(group_id)
+            return "贴表情计票启动失败：当前协议端无法给投票消息贴上两个表情"
+        # _setup_emoji_vote 已经发出公告但只有一个表情成功时，公告本身包含
+        # 指令回退说明，不再额外发第二条几乎相同的消息。
+        if record.message_id:
+            return ""
         return self._announcement(nickname, seconds, threshold, ttl, emoji=False)
 
     def _announcement(
         self, nickname: str, seconds: int, threshold: int, ttl: int, *, emoji: bool
     ) -> str:
-        how = (
-            "给这条消息贴 👍 表示赞同、贴 👎 表示反对"
-            if emoji
-            else "发送「赞同禁言 / 反对禁言」表态"
-        )
+        if emoji:
+            how = "给这条消息贴 👍 表示赞同、贴 👎 表示反对"
+            if self._mode == "两者都行":
+                how += "；若表情回应不可用，也可发送「赞同禁言 / 反对禁言」"
+        else:
+            how = "发送「赞同禁言 / 反对禁言」表态"
         return (
             f"已发起对 {nickname} 的禁言投票（禁言{seconds}秒）\n"
             f"{how}，任一方满 {threshold} 票立即结算，{ttl} 秒后按多数票结算"
@@ -158,13 +187,21 @@ class VoteFeature(Feature):
         if not message_id:
             return False
 
-        agree_emoji, disagree_emoji = self._emojis
-        if await add_reaction(event, message_id, agree_emoji):
-            return False
-        await add_reaction(event, message_id, disagree_emoji)
-
+        # 记住公告已经发出。即使第二个表情贴失败，「两者都行」也可以让
+        # 发起人继续用指令计票，而不应再重复发送一条公告。
         record.message_id = message_id
-        record.poll = asyncio.create_task(self._poll_reactions(event, record))
+        agree_emoji, disagree_emoji = self._emojis
+        # 两个表情必须都能贴上。只贴成功一个会让群友误以为投票可用，
+        # 但轮询永远收不到另一方的票，最终只能等超时；这种情况整体回退。
+        for emoji_id in (agree_emoji, disagree_emoji):
+            if error := await add_reaction(event, message_id, emoji_id):
+                logger.debug(
+                    f"{LOG_TAG} 投票表情初始化不完整 message={message_id} "
+                    f"emoji={emoji_id}: {error}"
+                )
+                return False
+
+        record.poll = self._spawn(self._poll_reactions(event, record))
         return True
 
     async def _send_own(self, event: AstrMessageEvent, text: str) -> str:
@@ -197,7 +234,8 @@ class VoteFeature(Feature):
         if voter_id == record.target_id and not allow_self:
             return "被投票的人不能自己投票"
 
-        record.votes[voter_id] = agree
+        record.command_votes[voter_id] = agree
+        self._merge_votes(record)
         return await self._check_threshold(event, record) or self._progress(
             record, await get_nickname(event, record.target_id)
         )
@@ -212,6 +250,8 @@ class VoteFeature(Feature):
     async def _check_threshold(self, event: AstrMessageEvent, record: VoteRecord) -> str:
         """够票就结算并返回结论文本，还没够票返回空串。"""
         if record.agree < record.threshold and record.disagree < record.threshold:
+            return ""
+        if not await self._claim_settlement(record):
             return ""
         nickname = await get_nickname(event, record.target_id)
         self._finish(record.group_id)
@@ -230,25 +270,41 @@ class VoteFeature(Feature):
                 await asyncio.sleep(POLL_INTERVAL)
                 if self._votes.get(record.group_id) is not record:
                     return
-                found = await reaction_users(
-                    event, record.message_id, (agree_emoji, disagree_emoji)
-                )
+                try:
+                    found = await reaction_users(
+                        event, record.message_id, (agree_emoji, disagree_emoji)
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - 下一轮继续尝试
+                    # 网络抖动或协议端暂时限流不应让整场表情投票静默失效；
+                    # 超时任务仍会兜底结算，下一轮再重新读取即可。
+                    logger.warning(
+                        f"{LOG_TAG} 读取投票表情失败 group={record.group_id}：{exc}"
+                    )
+                    continue
                 yes = found.get(agree_emoji, set())
                 no = found.get(disagree_emoji, set())
                 excluded = {self_id} if self_id else set()
                 if not allow_self:
                     excluded.add(record.target_id)
+                emoji_votes: dict[str, bool] = {}
                 # 两个都点的人算弃权，避免一个人顶两票
                 for uid in (yes - no) - excluded:
-                    record.votes[uid] = True
+                    emoji_votes[uid] = True
                 for uid in (no - yes) - excluded:
-                    record.votes[uid] = False
+                    emoji_votes[uid] = False
+                # 用本轮完整名单替换旧的表情票。成员取消表情后不再出现在
+                # yes/no 中，旧票随之消失；指令票仍由 command_votes 保留。
+                record.emoji_votes = emoji_votes
+                self._merge_votes(record)
                 if message := await self._check_threshold(event, record):
                     await event.send(event.plain_result(message))
                     return
         except asyncio.CancelledError:
             return
         except Exception as exc:  # noqa: BLE001
+            # 解析/发送结果等非预期错误也只结束轮询，不影响超时结算任务。
             logger.warning(f"{LOG_TAG} 贴表情计票失败 group={record.group_id}: {exc}")
 
     # ------------------------------------------------------------ 结算
@@ -261,6 +317,10 @@ class VoteFeature(Feature):
         except asyncio.CancelledError:
             return
         if self._votes.get(record.group_id) is not record:
+            return
+        # 超时结算与最后一轮表情轮询可能同时到达；先原子地认领结算权，
+        # 再取消另一条任务，避免重复禁言或重复发送结果。
+        if not await self._claim_settlement(record, force=True):
             return
         self._finish(record.group_id)
         nickname = await get_nickname(event, record.target_id)
@@ -306,13 +366,39 @@ class VoteFeature(Feature):
         )
         return f"{reason}！已禁言{nickname} {record.ban_time} 秒"
 
-    def _finish(self, group_id: str) -> None:
+    async def _claim_settlement(self, record: VoteRecord, *, force: bool = False) -> bool:
+        """原子地认领一场投票的结算权。"""
+        async with record.settle_lock:
+            if record.settled or self._votes.get(record.group_id) is not record:
+                return False
+            if not force and record.agree < record.threshold and record.disagree < record.threshold:
+                return False
+            record.settled = True
+            return True
+
+    @staticmethod
+    def _merge_votes(record: VoteRecord) -> None:
+        """合并两种来源的票；同一用户同时操作时以当前表情票为准。"""
+        record.votes = {**record.command_votes, **record.emoji_votes}
+
+    def _finish(self, group_id: str) -> list[asyncio.Task[None]]:
+        """从活动表移除投票并取消后台任务，返回实际取消的任务。"""
         record = self._votes.pop(group_id, None)
         if not record:
-            return
+            return []
+        record.settled = True
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        cancelled: list[asyncio.Task[None]] = []
         for task in (record.task, record.poll):
-            if task and not task.done():
+            # 不能取消当前正在执行的结算/轮询任务：CancelledError 会在它
+            # 下一次 await 时注入，导致结算结果还没发出去就被吞掉。
+            if task and task is not current and not task.done():
                 task.cancel()
+                cancelled.append(task)
+        return cancelled
 
     def status(self, group_id: Any) -> dict[str, Any] | None:
         record = self._votes.get(str(group_id))
@@ -332,3 +418,16 @@ class VoteFeature(Feature):
         """插件卸载时取消所有结算与轮询任务。"""
         for group_id in list(self._votes):
             self._finish(group_id)
+
+        # _finish 只处理仍挂在活动记录上的任务；这里再扫一遍追踪集合，
+        # 覆盖「任务已经认领结算、记录已弹出，但还在 await 协议端」的窗口。
+        try:
+            current = asyncio.current_task()
+        except RuntimeError:
+            current = None
+        tasks = [task for task in self._tasks if task is not current and not task.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._tasks.clear()

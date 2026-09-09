@@ -55,6 +55,11 @@ ACTION_LABELS: dict[str, str] = {
     "file_tidy": "整理群文件",
     "album_delete": "删除相册图片",
     "voice": "AI 声聊",
+    "todo_add": "群待办",
+    "todo_complete": "完成群待办",
+    "todo_cancel": "取消群待办",
+    "group_policy": "群管理策略",
+    "folder_rename": "重命名群文件夹",
     "set_config": "修改群配置",
     "reset_config": "重置群配置",
 }

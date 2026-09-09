@@ -10,14 +10,25 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..core.config import LOG_TAG
-from ..core.protocol import as_list, call_action
+from ..core.protocol import (
+    LLBOT,
+    NAPCAT,
+    SNOWLUMA,
+    ActionResult,
+    as_list,
+    call_action,
+    call_action_variants,
+    detect_backend,
+    explain_action_error,
+)
 from ..core.utils import download_file, extract_image_url, format_datetime, parse_int
 from .base import Feature, rest_of
 
-#: 发布 / 查看 / 删除群公告的动作名（各端都沿用带下划线前缀的 go-cqhttp 扩展名）
+#: 发布 / 查看群公告的动作名（各端都沿用带下划线前缀的 go-cqhttp 扩展名）
 _PUBLISH_ACTIONS: tuple[str, ...] = ("_send_group_notice",)
 _LIST_ACTIONS: tuple[str, ...] = ("_get_group_notice",)
-_DELETE_ACTIONS: tuple[str, ...] = ("_del_group_notice",)
+# NapCat / SnowLuma 使用 _del_group_notice，LLOneBot 使用自己的方言动作。
+_DELETE_ACTIONS: tuple[str, ...] = ("_del_group_notice", "_delete_group_notice")
 
 
 def _notice_text(notice: dict[str, Any]) -> str:
@@ -108,24 +119,89 @@ class NoticeFeature(Feature):
             return f"本群只有 {len(notices)} 条公告，找不到第 {position} 条"
 
         notice = notices[position - 1]
-        notice_id = str(notice.get("notice_id") or notice.get("noticeId") or "")
-        fid = str(notice.get("fid") or notice.get("notice_id") or "")
+        notice_id = str(
+            notice.get("notice_id")
+            or notice.get("noticeId")
+            or notice.get("id")
+            or ""
+        )
+        fid = str(
+            notice.get("fid")
+            or notice.get("feed_id")
+            or notice.get("feedId")
+            or ""
+        )
         if not notice_id and not fid:
             return "这条公告没有可用的标识，无法删除"
 
         group_id = event.get_group_id()
-        result = await call_action(
-            event,
-            _DELETE_ACTIONS,
-            group_id=int(group_id),
-            notice_id=notice_id or None,
-            fid=fid or None,
-        )
+        result = await self._delete_notice(event, int(group_id), notice_id, fid)
         summary = _notice_text(notice).strip().splitlines()
         preview = summary[0][:30] if summary else ""
         if not result.ok:
             await self.log(event, "notice_del", detail=result.error, success=False)
-            return f"删除群公告失败：{result.error}"
+            return f"删除群公告失败：{explain_action_error(result, '删除群公告')}"
 
         await self.log(event, "notice_del", detail=preview or f"第 {position} 条")
         return f"已删除第 {position} 条群公告" + (f"：{preview}" if preview else "")
+
+    async def _delete_notice(
+        self,
+        event: AstrMessageEvent,
+        group_id: int,
+        notice_id: str,
+        fid: str,
+    ) -> ActionResult:
+        """按协议端选择公告删除动作，并且每次只发送接口声明的参数。"""
+        backend = await detect_backend(event.bot)
+        if backend == LLBOT:
+            # LLBot's action is named _delete_group_notice and only accepts
+            # notice_id (its value is the same feed/request identifier).
+            variants = (
+                ("_delete_group_notice", {"group_id": group_id, "notice_id": notice_id or fid}),
+            )
+        elif backend == SNOWLUMA:
+            # SnowLuma accepts either spelling, but strict validation rejects
+            # sending both fields at once.  A feed id is the most faithful one.
+            variants = tuple(
+                variant
+                for variant in (
+                    ("_del_group_notice", {"group_id": group_id, "fid": fid})
+                    if fid
+                    else None,
+                    ("_del_group_notice", {"group_id": group_id, "notice_id": notice_id})
+                    if notice_id
+                    else None,
+                )
+                if variant is not None
+            )
+        elif backend == NAPCAT:
+            variants = (
+                ("_del_group_notice", {"group_id": group_id, "notice_id": notice_id or fid}),
+            )
+        else:
+            # Unknown implementations get all known safe combinations.  Do
+            # not merge the two identifiers into one request.
+            variants = tuple(
+                variant
+                for variant in (
+                    ("_del_group_notice", {"group_id": group_id, "notice_id": notice_id})
+                    if notice_id
+                    else None,
+                    ("_del_group_notice", {"group_id": group_id, "fid": fid})
+                    if fid
+                    else None,
+                    ("_delete_group_notice", {"group_id": group_id, "notice_id": notice_id})
+                    if notice_id
+                    else None,
+                    ("_delete_group_notice", {"group_id": group_id, "fid": fid})
+                    if fid
+                    else None,
+                )
+                if variant is not None
+            )
+        if not variants:
+            # The caller already checks this, but keep the helper total and
+            # avoid an opaque IndexError if it is reused later.
+            return ActionResult(error="公告没有可用标识")
+        return await call_action_variants(event, variants)

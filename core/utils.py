@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import aiohttp
 from astrbot.api import logger
@@ -70,10 +73,28 @@ def list_text(value: Any, empty: str = "（空）") -> str:
     return str(value)
 
 
+def timestamp_seconds(value: Any, default: int | None = None) -> int | None:
+    """把秒、毫秒、微秒或纳秒时间戳统一成 Unix 秒。"""
+    parsed = parse_int(value, default)
+    if parsed is None:
+        return default
+    # 当前 Unix 秒约为 1e9；协议端偶尔会把同一字段序列化成更高精度的
+    # 时间戳。按数量级逐级缩放，避免把毫秒时间显示成 51382 年。
+    result = parsed
+    for _ in range(3):
+        if abs(result) < 100_000_000_000:
+            break
+        result //= 1000
+    return result
+
+
 def format_date(timestamp: Any) -> str:
     """时间戳转 YYYY-MM-DD。"""
     try:
-        return time.strftime("%Y-%m-%d", time.localtime(int(timestamp)))
+        value = timestamp_seconds(timestamp)
+        if value is None:
+            return "未知"
+        return time.strftime("%Y-%m-%d", time.localtime(value))
     except (TypeError, ValueError, OSError):
         return "未知"
 
@@ -81,7 +102,10 @@ def format_date(timestamp: Any) -> str:
 def format_datetime(timestamp: Any) -> str:
     """时间戳转 YYYY-MM-DD HH:MM:SS。"""
     try:
-        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(timestamp)))
+        value = timestamp_seconds(timestamp)
+        if value is None:
+            return "未知"
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(value))
     except (TypeError, ValueError, OSError):
         return "未知"
 
@@ -245,9 +269,16 @@ def extract_image_url(event: AstrMessageEvent) -> str | None:
     for chain in chains:
         for segment in chain:
             if isinstance(segment, Image):
-                url = getattr(segment, "url", None) or getattr(segment, "file", None)
-                if url:
-                    return url
+                # AstrBot's Image.fromFileSystem keeps the real path in
+                # ``path`` but exposes a file:/// URI in ``file``.  Prefer the
+                # path so Windows drive letters and spaces are not lost.
+                for value in (
+                    getattr(segment, "path", None),
+                    getattr(segment, "url", None),
+                    getattr(segment, "file", None),
+                ):
+                    if value:
+                        return str(value)
     return None
 
 
@@ -282,7 +313,14 @@ async def get_nickname(event: AstrMessageEvent, user_id: str | int) -> str:
 # 网络                                                                          #
 # --------------------------------------------------------------------------- #
 async def download_bytes(url: str, timeout: int = 30) -> bytes | None:
-    """下载 URL 内容。保留原始协议，不做 https->http 降级。"""
+    """下载 URL 内容，也兼容 ``file://`` 指向的本地文件。"""
+    if str(url).lower().startswith("file:"):
+        path = _local_path_from_source(str(url))
+        try:
+            return path.read_bytes() if path.is_file() else None
+        except OSError as exc:
+            logger.warning(f"[群务管家] 读取本地文件失败 {url}: {exc}")
+            return None
     try:
         client_timeout = aiohttp.ClientTimeout(total=timeout)
         async with (
@@ -307,25 +345,59 @@ async def download_file(url: str, save_path: Path, timeout: int = 60) -> Path | 
 
 
 async def load_bytes(source: str) -> bytes | None:
-    """把本地路径 / URL / base64:// 统一读成 bytes。"""
+    """把本地路径 / file URI / URL / base64 统一读成 bytes。"""
     if not source:
         return None
-    if source.startswith("base64://"):
-        import base64
-
+    source = str(source).strip()
+    lowered = source.lower()
+    if lowered.startswith("base64://"):
         try:
-            return base64.b64decode(source[9:])
+            encoded = "".join(source[9:].split())
+            return base64.b64decode(encoded, validate=True)
         except Exception:  # noqa: BLE001
             return None
-    path = Path(source)
+
+    if lowered.startswith("data:"):
+        try:
+            header, encoded = source.split(",", 1)
+            if ";base64" in header.lower():
+                return base64.b64decode("".join(encoded.split()), validate=True)
+            from urllib.parse import unquote as unquote_data
+
+            return unquote_data(encoded).encode("utf-8")
+        except Exception:  # noqa: BLE001
+            return None
+
+    path = _local_path_from_source(source)
     try:
         if path.is_file():
             return path.read_bytes()
     except OSError:
         pass
-    if source.startswith(("http://", "https://")):
+    if lowered.startswith(("http://", "https://")):
         return await download_bytes(source)
     return None
+
+
+def _local_path_from_source(source: str) -> Path:
+    """将本地路径或 file:// URI 转成 Path；远程 URL 返回一个无效 Path。"""
+    if not source.lower().startswith("file:"):
+        return Path(source)
+
+    parsed = urlsplit(source)
+    path = unquote(parsed.path or "")
+    netloc = unquote(parsed.netloc or "")
+    if netloc and netloc.lower() != "localhost":
+        # UNC path: file://server/share/file
+        path = f"//{netloc}{path}"
+    elif netloc and len(netloc) == 2 and netloc[1] == ":":
+        # Non-standard but common file://C:/path form.
+        path = f"{netloc}{path}"
+
+    # urlsplit gives file:///C:/... as /C:/... on Windows.
+    if os.name == "nt" and re.match(r"^/[A-Za-z]:", path):
+        path = path[1:]
+    return Path(path)
 
 
 async def gather_limited(coros: list[Any], limit: int = 10) -> list[Any]:

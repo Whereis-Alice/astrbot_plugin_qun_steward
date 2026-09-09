@@ -16,6 +16,7 @@ import pytest
 from astrbot_plugin_qun_steward.core.config import Section
 from astrbot_plugin_qun_steward.core.db import Database
 from astrbot_plugin_qun_steward.core.store import GroupStore
+from astrbot_plugin_qun_steward.core.utils import parse_bool
 
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 
@@ -95,7 +96,9 @@ class FakeConfig:
         self.admin_audit: bool = bool(overrides.pop("admin_audit", False))
         self.random_ban_time: str = str(overrides.pop("random_ban_time", "30~300"))
         self.llm_get_msg_count: int = int(overrides.pop("llm_get_msg_count", 10))
-        self.enable_llm_tools: bool = bool(overrides.pop("enable_llm_tools", True))
+        self.enable_llm_tools: bool = (
+            parse_bool(overrides.pop("enable_llm_tools", False), default=False) is True
+        )
         self.timezone: str = "Asia/Shanghai"
         self._sections: dict[str, dict[str, Any]] = {
             name: dict(values) for name, values in _DEFAULT_SECTIONS.items()

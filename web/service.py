@@ -14,7 +14,6 @@ from astrbot.api import logger
 from ..core.audit import action_label
 from ..core.config import DISPLAY_NAME, LOG_TAG, PLUGIN_NAME, StewardConfig
 from ..core.permission import PERM_OPTIONS, PermLevel
-from ..core.protocol import backend_label
 from ..core.store import FIELD_LABELS
 from ..core.utils import format_datetime, parse_bool, parse_int
 from ..features.base import FeatureContext
@@ -134,7 +133,10 @@ class StewardWebService:
             },
             "pending_joins": len(pending),
             "curfew": curfew,
-            "backend": backend_label(None),
+            # WebUI 没有绑定某一条群消息，不能在这里安全地猜具体协议端；
+            # 实际动作会按当前 bot 实例自动探测。不要返回 None，让前端显示
+            # 成空白并误以为状态异常。
+            "backend": "自动识别（NapCat / LLOneBot / SnowLuma）",
             "undo_window": self.ctx.undo.window,
             "generated_at": format_datetime(time.time()),
         }

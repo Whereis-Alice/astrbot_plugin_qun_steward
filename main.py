@@ -27,6 +27,7 @@ from .core.db import Database
 from .core.group_cache import GroupInfoCache
 from .core.messaging import send_forward, split_text
 from .core.permission import PermissionResolver, PermLevel, perm_required
+from .core.protocol import clear_backend_cache
 from .core.store import GroupStore
 from .core.undo import UndoStack
 from .core.utils import parse_bool
@@ -42,6 +43,7 @@ from .features.member import MemberFeature
 from .features.moderation import ModerationFeature
 from .features.notice import NoticeFeature
 from .features.recall import RecallFeature
+from .features.todo import TodoFeature
 from .features.voice import VoiceFeature
 from .features.vote import VoteFeature
 from .features.words import WordFeature
@@ -110,6 +112,7 @@ class QunStewardPlugin(Star):
         self.member = MemberFeature(feature_ctx)
         self.files = FilesFeature(feature_ctx)
         self.insight = InsightFeature(feature_ctx)
+        self.todo = TodoFeature(feature_ctx)
         self.voice = VoiceFeature(feature_ctx)
         self.album = AlbumFeature(feature_ctx)
         self.configs = ConfigFeature(feature_ctx)
@@ -138,11 +141,15 @@ class QunStewardPlugin(Star):
         logger.info(f"{LOG_TAG} 初始化完成，已加载 {len(self.store.overridden_group_ids())} 个自定义群配置")
 
     async def terminate(self) -> None:
-        for task in list(self._tasks):
+        tasks = list(self._tasks)
+        for task in tasks:
             task.cancel()
         self._tasks.clear()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
         await self.vote.shutdown()
         await self.curfew.shutdown()
+        clear_backend_cache()
         await self.db.close()
         logger.info(f"{LOG_TAG} 已卸载")
 
@@ -279,7 +286,7 @@ class QunStewardPlugin(Star):
         yield event.plain_result(await self.moderation.whole_ban(event, _switch(event, True)))
 
     @filter.command("投票禁言")
-    @perm_required(PermLevel.ADMIN, perm_key="vote")
+    @perm_required(PermLevel.ADMIN, perm_key="vote_start")
     async def cmd_vote_start(self, event: AstrMessageEvent):
         """投票禁言 <秒数> @某人：发起投票"""
         if reply := await self.vote.start(event, ban_time=_optional(event)):
@@ -288,13 +295,13 @@ class QunStewardPlugin(Star):
     @filter.command("赞同禁言", alias={"同意禁言"})
     @perm_required(PermLevel.ADMIN, perm_key="vote")
     async def cmd_vote_agree(self, event: AstrMessageEvent):
-        """赞同禁言：为进行中的投票投赞成票"""
+        """赞同禁言：成员为进行中的投票投赞成票"""
         yield event.plain_result(await self.vote.cast(event, True))
 
     @filter.command("反对禁言", alias={"不同意禁言"})
     @perm_required(PermLevel.ADMIN, perm_key="vote")
     async def cmd_vote_disagree(self, event: AstrMessageEvent):
-        """反对禁言：为进行中的投票投反对票"""
+        """反对禁言：成员为进行中的投票投反对票"""
         yield event.plain_result(await self.vote.cast(event, False))
 
     @filter.command("开启宵禁")
@@ -312,6 +319,68 @@ class QunStewardPlugin(Star):
     async def cmd_curfew_off(self, event: AstrMessageEvent):
         """关闭宵禁：取消本群的宵禁计划"""
         yield event.plain_result(await self.curfew.disable(event))
+
+    # ================================================================ 群待办
+
+    @filter.command("设群待办", alias={"设置群待办"})
+    @perm_required(PermLevel.ADMIN, perm_key="group_todo")
+    async def cmd_todo_set(self, event: AstrMessageEvent):
+        """设群待办：必须引用一条群消息。"""
+        yield event.plain_result(await self.todo.set(event))
+
+    @filter.command("群待办", alias={"群待办列表"})
+    @perm_required(PermLevel.MEMBER, perm_key="group_todo")
+    async def cmd_todo_list(self, event: AstrMessageEvent):
+        """群待办：实时列出当前群待办及操作序号。"""
+        result = await self._long(event, await self.todo.show(event))
+        if result:
+            yield result
+
+    @filter.command("完成群待办")
+    @perm_required(PermLevel.ADMIN, perm_key="group_todo")
+    async def cmd_todo_complete(self, event: AstrMessageEvent):
+        """完成群待办 <序号>：序号来自「群待办」的实时列表。"""
+        yield event.plain_result(await self.todo.complete(event, _arg(event)))
+
+    @filter.command("取消群待办")
+    @perm_required(PermLevel.ADMIN, perm_key="group_todo")
+    async def cmd_todo_cancel(self, event: AstrMessageEvent):
+        """取消群待办 <序号>：序号来自「群待办」的实时列表。"""
+        yield event.plain_result(await self.todo.cancel(event, _arg(event)))
+
+    # ================================================================ 群管理策略
+
+    @filter.command("设置加群方式", alias={"加群方式"})
+    @perm_required(PermLevel.ADMIN, perm_key="group_policy")
+    async def cmd_set_add_option(self, event: AstrMessageEvent):
+        """设置加群方式：不带参数时查询当前值。"""
+        yield event.plain_result(await self.insight.set_add_option(event, rest_of(event)))
+
+    @filter.command("设置入群问题", alias={"入群问题"})
+    @perm_required(PermLevel.ADMIN, perm_key="group_policy")
+    async def cmd_set_join_question(self, event: AstrMessageEvent):
+        """设置入群问题 <问题> [|答案]：清空可写「清空」。"""
+        yield event.plain_result(await self.insight.set_join_question(event, rest_of(event)))
+
+    @filter.command("群搜索", alias={"设置群搜索"})
+    @perm_required(PermLevel.ADMIN, perm_key="group_policy")
+    async def cmd_set_group_search(self, event: AstrMessageEvent):
+        """群搜索 开/关：不带参数时查询当前值。"""
+        yield event.plain_result(await self.insight.set_search(event, rest_of(event)))
+
+    @filter.command("成员邀请", alias={"设置成员邀请"})
+    @perm_required(PermLevel.ADMIN, perm_key="group_policy")
+    async def cmd_set_invite_policy(self, event: AstrMessageEvent):
+        """成员邀请 <策略>：设置群成员邀请规则。"""
+        yield event.plain_result(await self.insight.set_invite_policy(event, rest_of(event)))
+
+    @filter.command("新成员历史", alias={"设置新成员历史"})
+    @perm_required(PermLevel.ADMIN, perm_key="group_policy")
+    async def cmd_set_history_visibility(self, event: AstrMessageEvent):
+        """新成员历史 开/关：设置新成员能否查看入群前消息。"""
+        yield event.plain_result(
+            await self.insight.set_history_visibility(event, rest_of(event))
+        )
 
     # ================================================================ 成员管理
 
@@ -612,6 +681,18 @@ class QunStewardPlugin(Star):
         if result:
             yield result
 
+    @filter.command("删除群文件夹", alias={"删除群文件目录"})
+    @perm_required(PermLevel.ADMIN, perm_key="manage_group_file")
+    async def cmd_file_folder_delete(self, event: AstrMessageEvent):
+        """删除群文件夹 <名称或序号>：非空文件夹必须二次确认。"""
+        yield event.plain_result(await self.files.delete_folder(event, rest_of(event)))
+
+    @filter.command("重命名群文件夹", alias={"群文件夹改名"})
+    @perm_required(PermLevel.ADMIN, perm_key="manage_group_file")
+    async def cmd_file_folder_rename(self, event: AstrMessageEvent):
+        """重命名群文件夹 <原名称或序号> <新名称>。"""
+        yield event.plain_result(await self.files.rename_folder(event, rest_of(event)))
+
     # ================================================================ 群相册
 
     @filter.command("上传群相册", alias={"up"})
@@ -721,7 +802,7 @@ class QunStewardPlugin(Star):
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_album_keyword(self, event: AstrMessageEvent):
-        """关键词随机图：命中相册名时随机发一张留档图片"""
+        """关键词随机图：命中相册名时从云端相册随机发图，必要时本地兜底"""
         if picked := await self.album.random_keyword(event):
             yield event.chain_result([self._image(picked)])
 

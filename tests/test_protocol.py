@@ -12,11 +12,15 @@ from astrbot_plugin_qun_steward.core.protocol import (
     SNOWLUMA,
     album_name_of,
     backend_label,
+    call_action_variants,
     clear_backend_cache,
     create_album,
+    del_album_media,
     detect_backend,
     extract_failure,
     find_album,
+    is_unsupported_error,
+    list_album_media,
     list_albums,
     normalize_album_list,
     supports_album_create,
@@ -68,6 +72,7 @@ class TestDetectBackend:
             ("NapCat.Onebot", NAPCAT),
             ("LLOneBot", LLBOT),
             ("llonebot", LLBOT),
+            ("LLBot", LLBOT),
             ("SnowLuma", SNOWLUMA),
             ("snowluma-onebot", SNOWLUMA),
         ],
@@ -215,6 +220,9 @@ class TestExtractFailure:
     def test_retcode_failure(self) -> None:
         assert "retcode" in extract_failure({"status": "ok", "retcode": 1200})
 
+    def test_string_retcode_failure(self) -> None:
+        assert "retcode" in extract_failure({"status": "ok", "retcode": "1200"})
+
     @pytest.mark.parametrize("key", ["message", "wording", "msg"])
     def test_failed_status_uses_message(self, key: str) -> None:
         assert extract_failure({"status": "failed", key: "没权限"}) == "没权限"
@@ -229,6 +237,85 @@ class TestExtractFailure:
 
     def test_zero_success_with_fail_count_field(self) -> None:
         assert extract_failure(_ok({"success_count": 0, "fail_count": 0})) != ""
+
+    def test_string_upload_counters(self) -> None:
+        assert "fail_count=1" in extract_failure(
+            _ok({"success_count": "0", "fail_count": "1"})
+        )
+
+    def test_nested_error_message(self) -> None:
+        assert extract_failure(
+            {"status": "ok", "retcode": "1200", "data": {"retMsg": "拒绝"}}
+        ) == "拒绝"
+
+
+class TestActionCapabilityCache:
+    async def test_parameter_error_does_not_skip_next_variant(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def handler(kwargs: dict[str, Any]) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return {"status": "failed", "message": "unsupported parameter: old_name"}
+            return _ok({"accepted": True})
+
+        event = _ScriptedEvent("NapCat", {"move_group_file": handler})
+        result = await call_action_variants(
+            event,
+            (
+                ("move_group_file", {"old_name": "x"}),
+                ("move_group_file", {"new_name": "x"}),
+            ),
+        )  # type: ignore[arg-type]
+        assert result.ok
+        assert calls == [{"old_name": "x"}, {"new_name": "x"}]
+
+    async def test_parameter_error_is_not_cached_for_later_call(self) -> None:
+        calls = 0
+
+        def handler(_kwargs: dict[str, Any]) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {"status": "failed", "message": "unsupported parameter"}
+            return _ok({})
+
+        event = _ScriptedEvent("NapCat", {"some_action": handler})
+        first = await call_action_variants(
+            event, (("some_action", {"a": 1}),)
+        )  # type: ignore[arg-type]
+        second = await call_action_variants(
+            event, (("some_action", {"b": 2}),)
+        )  # type: ignore[arg-type]
+        assert not first.ok and second.ok
+        assert calls == 2
+
+    async def test_missing_action_is_cached(self) -> None:
+        event = _ScriptedEvent("NapCat", {})
+        first = await call_action_variants(
+            event, (("missing_action", {}),)
+        )  # type: ignore[arg-type]
+        second = await call_action_variants(
+            event, (("missing_action", {}),)
+        )  # type: ignore[arg-type]
+        assert not first.ok and not second.ok
+        assert event.api.actions == ["missing_action"]
+
+    @pytest.mark.parametrize(
+        ("reason", "expected"),
+        [
+            ("unsupported action", True),
+            ("action not found", True),
+            ("协议端不支持动作 move_group_file", True),
+            ("unsupported parameter: parent_directory", False),
+            ("参数不支持", False),
+            ("unsupported", False),
+        ],
+    )
+    def test_only_action_missing_errors_are_capability_errors(
+        self, reason: str, expected: bool
+    ) -> None:
+        assert is_unsupported_error(reason) is expected
 
 
 class TestListAlbums:
@@ -283,6 +370,56 @@ class TestListAlbums:
         album = await find_album(event, 123, "日常")  # type: ignore[arg-type]
         assert album is not None
         assert album["album_id"] == "a1"
+
+    async def test_snowluma_album_pagination_passes_cursor(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def handler(kwargs: dict[str, Any]) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return _ok(
+                    {
+                        "album_list": [{"id": "a1", "name": "第一页"}],
+                        "attach_info": "next-page",
+                        "has_more": True,
+                    }
+                )
+            return _ok({"album_list": [{"id": "a2", "name": "第二页"}], "has_more": False})
+
+        event = _ScriptedEvent("SnowLuma", {"get_qun_album_list": handler})
+        albums = await list_albums(event, 123)  # type: ignore[arg-type]
+        assert [item["album_id"] for item in albums] == ["a1", "a2"]
+        assert calls[0] == {"group_id": 123}
+        assert calls[1] == {"group_id": 123, "attach_info": "next-page"}
+
+    async def test_llbot_media_listing_accepts_official_cursor(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def handler(kwargs: dict[str, Any]) -> Any:
+            calls.append(kwargs)
+            if len(calls) == 1:
+                return _ok(
+                    {
+                        "media_list": [{"lloc": "m1", "url": "https://x/1.jpg"}],
+                        "next_attach_info": "next-page",
+                        "next_has_more": True,
+                    }
+                )
+            return _ok(
+                {
+                    "media_list": [{"lloc": "m2", "url": "https://x/2.jpg"}],
+                    "next_attach_info": "",
+                    "next_has_more": False,
+                }
+            )
+
+        event = _ScriptedEvent("LLOneBot", {"get_group_album_media_list": handler})
+        medias = await list_album_media(event, 123, "a1")  # type: ignore[arg-type]
+        assert [item["media_id"] for item in medias] == ["m1", "m2"]
+        assert calls == [
+            {"group_id": 123, "album_id": "a1"},
+            {"group_id": 123, "album_id": "a1", "attach_info": "next-page"},
+        ]
 
 
 class TestUploadAlbumImage:
@@ -362,3 +499,99 @@ class TestCreateAlbum:
             "LLOneBot", {"create_group_album": {"status": "failed", "message": "没权限"}}
         )
         assert await create_album(event, 123, "日常") is None  # type: ignore[arg-type]
+
+
+class TestAlbumMedia:
+    async def test_snowluma_nested_image_prefers_raw_default_url(self) -> None:
+        payload = _ok(
+            {
+                "mediaList": [
+                    {
+                        "type": 1,
+                        "image": {
+                            "lloc": "img-1",
+                            "hasRaw": True,
+                            "photoUrl": [
+                                {"spec": 1, "url": {"url": "https://cdn/thumb.jpg"}},
+                                {"spec": 3, "url": {"url": "https://cdn/large.jpg"}},
+                            ],
+                            "defaultUrl": {"url": "https://cdn/original.jpg"},
+                        },
+                    }
+                ],
+                "nextAttachInfo": "",
+                "nextHasMore": False,
+            }
+        )
+        event = _ScriptedEvent("SnowLuma", {"get_group_album_media_list": payload})
+        medias = await list_album_media(event, 123, "a1")  # type: ignore[arg-type]
+        assert medias[0]["media_id"] == "img-1"
+        assert medias[0]["url"] == "https://cdn/original.jpg"
+
+    async def test_snowluma_nested_video_uses_video_id_and_url(self) -> None:
+        payload = _ok(
+            {
+                "mediaList": [
+                    {
+                        "video": {
+                            "id": "video-1",
+                            "url": "https://cdn/video.mp4",
+                            "cover": {"lloc": "cover-1"},
+                        },
+                        "batchId": "77",
+                    }
+                ],
+                "nextAttachInfo": "",
+                "nextHasMore": False,
+            }
+        )
+        event = _ScriptedEvent("SnowLuma", {"get_group_album_media_list": payload})
+        medias = await list_album_media(event, 123, "a1")  # type: ignore[arg-type]
+        assert medias[0]["media_id"] == "video-1"
+        assert medias[0]["url"] == "https://cdn/video.mp4"
+        assert medias[0]["is_video"] is True
+
+    async def test_media_pagination_stops_on_repeated_cursor(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def handler(kwargs: dict[str, Any]) -> Any:
+            calls.append(kwargs)
+            return _ok(
+                {
+                    "mediaList": [{"lloc": str(len(calls)), "url": f"https://x/{len(calls)}.jpg"}],
+                    "nextAttachInfo": "same",
+                    "nextHasMore": True,
+                }
+            )
+
+        event = _ScriptedEvent("SnowLuma", {"get_group_album_media_list": handler})
+        medias = await list_album_media(event, 123, "a1")  # type: ignore[arg-type]
+        assert len(medias) == 2
+        assert len(calls) == 2
+
+    async def test_delete_sends_only_lloc(self) -> None:
+        event = _ScriptedEvent("SnowLuma", {"del_group_album_media": _ok({})})
+        assert await del_album_media(event, 123, "a1", "img-1") == ""  # type: ignore[arg-type]
+        _, params = event.api.calls[-1]
+        assert params == {"group_id": 123, "album_id": "a1", "lloc": "img-1"}
+
+    async def test_llbot_media_listing_passes_supported_cursor(self) -> None:
+        calls: list[dict[str, Any]] = []
+
+        def handler(kwargs: dict[str, Any]) -> Any:
+            calls.append(kwargs)
+            return _ok(
+                {
+                    "mediaList": [{"lloc": "m1", "url": "https://x/1.jpg"}],
+                    "nextAttachInfo": "next-page",
+                    "nextHasMore": True,
+                }
+            )
+
+        event = _ScriptedEvent("LLOneBot", {"get_group_album_media_list": handler})
+        medias = await list_album_media(event, 123, "a1")  # type: ignore[arg-type]
+        assert [item["media_id"] for item in medias] == ["m1"]
+        assert calls == [
+            {"group_id": 123, "album_id": "a1"},
+            {"group_id": 123, "album_id": "a1", "attach_info": "next-page"},
+        ]

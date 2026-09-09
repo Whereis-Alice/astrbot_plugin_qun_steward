@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import time
 
 import pytest
@@ -165,6 +166,27 @@ def test_split_tokens() -> None:
     assert split_tokens("全角\u3000空格  也切") == ["全角", "空格", "也切"]
     assert split_tokens("   ") == []
     assert split_tokens("") == []
+
+
+class TestLoadBytes:
+    async def test_windows_style_file_uri_reads_local_file(self, tmp_path) -> None:
+        from astrbot_plugin_qun_steward.core.utils import load_bytes
+
+        target = tmp_path / "带空格.txt"
+        target.write_bytes(b"hello")
+        assert await load_bytes(target.resolve().as_uri()) == b"hello"
+
+    async def test_data_and_base64_sources(self) -> None:
+        from astrbot_plugin_qun_steward.core.utils import load_bytes
+
+        encoded = base64.b64encode(b"hello").decode()
+        assert await load_bytes("base64://" + encoded) == b"hello"
+        assert await load_bytes("data:text/plain;base64," + encoded) == b"hello"
+
+    async def test_invalid_encoded_source_is_none(self) -> None:
+        from astrbot_plugin_qun_steward.core.utils import load_bytes
+
+        assert await load_bytes("base64://not-valid!!!") is None
 
 
 class TestApplyDelta:
