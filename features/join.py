@@ -1,4 +1,4 @@
-"""进群审核、进群欢迎、退群通知。
+"""进群审核、退群通知。
 
 与上游相比的主要改动：
 - 进群申请落库（join_request 表）并分配群内短序号，因此可以直接
@@ -47,13 +47,6 @@ _IGNORED_ACTIONS: tuple[str, ...] = (
 SYNC_LIMIT = 50
 
 
-class _WelcomeValues(dict[str, str]):
-    """让未认识的欢迎语占位符原样保留。"""
-
-    def __missing__(self, key: str) -> str:
-        return "{" + key + "}"
-
-
 class JoinFeature(Feature):
     """进群 / 退群相关的配置指令与事件处理。"""
 
@@ -86,53 +79,6 @@ class JoinFeature(Feature):
                 await event.bot.send_private_msg(user_id=int(admin_id), message=text)
             except Exception as exc:  # noqa: BLE001
                 logger.error(f"{LOG_TAG} 通知超管 {admin_id} 失败：{exc}")
-
-    @staticmethod
-    def _event_group_name(event: AstrMessageEvent, group_id: str) -> str:
-        """优先从事件原始字段取群名，避免每条新人事件都额外请求一次。"""
-        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        if not isinstance(raw, dict):
-            return ""
-        for key in ("group_name", "groupName", "name"):
-            value = raw.get(key)
-            if value not in (None, ""):
-                return str(value).strip()
-        group = raw.get("group")
-        if isinstance(group, dict):
-            for key in ("group_name", "groupName", "name"):
-                value = group.get(key)
-                if value not in (None, ""):
-                    return str(value).strip()
-        return ""
-
-    async def _welcome_group_name(self, event: AstrMessageEvent, group_id: str) -> str:
-        """补取群名；协议端不可用时用群号作为稳定兜底。"""
-        if name := self._event_group_name(event, group_id):
-            return name
-        getter = getattr(event.bot, "get_group_info", None)
-        if callable(getter):
-            try:
-                try:
-                    info = await getter(group_id=int(group_id), no_cache=False)
-                except TypeError:
-                    # 旧版适配器不接受 no_cache。
-                    info = await getter(group_id=int(group_id))
-                info = unwrap(info)
-                if isinstance(info, dict):
-                    for key in ("group_name", "groupName", "name"):
-                        value = info.get(key)
-                        if value not in (None, ""):
-                            return str(value).strip()
-                    for key in ("group_info", "groupInfo", "info", "data"):
-                        nested = info.get(key)
-                        if isinstance(nested, dict):
-                            for name_key in ("group_name", "groupName", "name"):
-                                value = nested.get(name_key)
-                                if value not in (None, ""):
-                                    return str(value).strip()
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"{LOG_TAG} 获取群名失败 group={group_id}：{exc}")
-        return group_id
 
     # ------------------------------------------------------- 配置类指令 --- #
     async def toggle_review(self, event: AstrMessageEvent, mode: Any = None) -> str:
@@ -237,25 +183,6 @@ class JoinFeature(Feature):
         if value <= 0:
             return "已关闭本群进群禁言"
         return f"本群进群禁言已设为：{value} 秒"
-
-    async def set_welcome(self, event: AstrMessageEvent) -> str:
-        group_id = event.get_group_id()
-        raw = rest_of(event)
-        if not raw:
-            text = str(self.store.value(group_id, "join_welcome") or "")
-            return "本群进群欢迎语：\n" + (text or "（未设置）")
-        if raw in {"关", "关闭", "取消", "清空"}:
-            await self.store.set(group_id, "join_welcome", "")
-            await self.log(event, "join_welcome", detail="清空")
-            return "已关闭本群进群欢迎"
-        await self.store.set(group_id, "join_welcome", raw)
-        await self.log(event, "join_welcome", detail=raw)
-        placeholders = ("{nickname}", "{group_name}", "{user_id}")
-        tip = "" if any(item in raw for item in placeholders) else (
-            "\n提示：可用 {nickname}（昵称）、{group_name}（群名）、"
-            "{user_id}（QQ号）占位"
-        )
-        return f"本群进群欢迎语已设为：\n{raw}{tip}"
 
     async def toggle_leave_notify(self, event: AstrMessageEvent, mode: Any = None) -> str:
         group_id = event.get_group_id()
@@ -659,7 +586,7 @@ class JoinFeature(Feature):
 
     # ------------------------------------------------------- 事件监听 --- #
     async def event_monitoring(self, event: AstrMessageEvent) -> str | None:
-        """监听进群申请 / 进群 / 退群。返回需要在群里说的话。"""
+        """监听进群申请 / 退群。返回需要在群里说的话。"""
         raw = getattr(event.message_obj, "raw_message", None)
         if not isinstance(raw, dict):
             return None
@@ -697,35 +624,6 @@ class JoinFeature(Feature):
             )
             return message
 
-        if notice_type == "group_increase" and user_id != str(event.get_self_id()):
-            welcome = str(self.store.value(group_id, "join_welcome") or "")
-            reply: str | None = None
-            if welcome:
-                nickname = await get_nickname(event, user_id)
-                try:
-                    values = {
-                        "nickname": nickname,
-                        "group_name": (
-                            await self._welcome_group_name(event, group_id)
-                            if "{group_name}" in welcome
-                            else group_id
-                        ),
-                        "user_id": user_id,
-                    }
-
-                    reply = welcome.format_map(_WelcomeValues(values))
-                except (AttributeError, IndexError, KeyError, ValueError):
-                    # 欢迎语里写了不支持的占位符，原样发出去而不是报错
-                    reply = welcome
-            ban_time = parse_int(self.store.value(group_id, "join_ban_time"), 0) or 0
-            if ban_time > 0:
-                try:
-                    await event.bot.set_group_ban(
-                        group_id=int(group_id), user_id=int(user_id), duration=ban_time
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"{LOG_TAG} 进群禁言失败 group={group_id}: {exc}")
-            return reply
         return None
 
     async def _handle_join_request(

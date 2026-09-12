@@ -53,9 +53,81 @@
       },
       "join_welcome": {
         "description": "进群欢迎词",
-        "hint": "支持占位符 {nickname}（新人昵称）、{group_name}（群名）、{user_id}（QQ号）。留空表示不发欢迎。",
+        "hint": "兼容旧版单条欢迎语。支持 {at}、{nickname}、{group_name}、{user_id} 等占位符；配置多模板时以「欢迎模板」优先。",
         "type": "string",
         "default": ""
+      },
+      "welcome_templates": {
+        "description": "欢迎模板",
+        "hint": "支持 {at}（@新人）、{nickname}、{group_name}、{member_count}、{join_time} 等占位符。多条模板用「||」分隔；非空时优先于旧「进群欢迎词」。",
+        "type": "list",
+        "default": []
+      },
+      "welcome_mode": {
+        "description": "欢迎模板模式",
+        "hint": "随机=每次随机选一条；顺序=按顺序轮播。",
+        "type": "string",
+        "default": "随机",
+        "options": [
+          "随机",
+          "顺序"
+        ]
+      },
+      "welcome_images": {
+        "description": "欢迎图片",
+        "hint": "支持图片 URL、本地路径或 file:// 路径，可配置多张并按顺序追加到欢迎语后。",
+        "type": "list",
+        "default": []
+      },
+      "welcome_delay": {
+        "description": "欢迎延迟秒数",
+        "hint": "0 表示立即发送，范围 0~300 秒。开启入群验证时，延迟会在验证通过后生效。",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 300,
+          "step": 1
+        }
+      },
+      "welcome_verify": {
+        "description": "入群算术验证",
+        "hint": "开启后新人需在群里回复纯数字答案；验证期间会跳过「进群禁言」，否则新人无法回答。",
+        "type": "bool",
+        "default": false
+      },
+      "welcome_verify_timeout": {
+        "description": "验证超时秒数",
+        "hint": "范围 15~3600 秒，超时后按「验证失败动作」处理。",
+        "type": "int",
+        "default": 120,
+        "slider": {
+          "min": 15,
+          "max": 3600,
+          "step": 15
+        }
+      },
+      "welcome_verify_max_attempts": {
+        "description": "验证答错上限",
+        "hint": "达到上限后按「验证失败动作」处理；0 表示不限次数。",
+        "type": "int",
+        "default": 3,
+        "slider": {
+          "min": 0,
+          "max": 10,
+          "step": 1
+        }
+      },
+      "welcome_verify_timeout_action": {
+        "description": "验证失败动作",
+        "hint": "超时或答错达到上限后的处理方式。踢出并拉黑会写入本群「进群黑名单」。",
+        "type": "string",
+        "default": "踢出",
+        "options": [
+          "踢出",
+          "踢出并拉黑",
+          "仅提醒"
+        ]
       },
       "join_ban_time": {
         "description": "新人进群禁言时长（秒）",

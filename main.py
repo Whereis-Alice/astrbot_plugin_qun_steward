@@ -46,6 +46,7 @@ from .features.recall import RecallFeature
 from .features.todo import TodoFeature
 from .features.voice import VoiceFeature
 from .features.vote import VoteFeature
+from .features.welcome import WelcomeFeature
 from .features.words import WordFeature
 from .web import StewardWebController
 
@@ -114,6 +115,7 @@ class QunStewardPlugin(Star):
         self.insight = InsightFeature(feature_ctx)
         self.todo = TodoFeature(feature_ctx)
         self.voice = VoiceFeature(feature_ctx)
+        self.welcome = WelcomeFeature(feature_ctx)
         self.album = AlbumFeature(feature_ctx)
         self.configs = ConfigFeature(feature_ctx)
 
@@ -149,6 +151,7 @@ class QunStewardPlugin(Star):
             await asyncio.gather(*tasks, return_exceptions=True)
         await self.vote.shutdown()
         await self.curfew.shutdown()
+        await self.welcome.shutdown()
         clear_backend_cache()
         await self.db.close()
         logger.info(f"{LOG_TAG} 已卸载")
@@ -610,10 +613,68 @@ class QunStewardPlugin(Star):
         yield event.plain_result(await self.join.set_join_ban(event, _optional(event)))
 
     @filter.command("进群欢迎")
-    @perm_required(PermLevel.MEMBER, perm_key="welcome")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
     async def cmd_join_welcome(self, event: AstrMessageEvent):
-        """进群欢迎 <欢迎语>：支持 {nickname} 占位，留空查看，「关」清空"""
-        yield event.plain_result(await self.join.set_welcome(event))
+        """进群欢迎 <欢迎语>：兼容旧的单条欢迎语设置"""
+        yield event.plain_result(await self.welcome.set_legacy_text(event))
+
+    @filter.command("欢迎模板")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_templates(self, event: AstrMessageEvent):
+        """欢迎模板 [模板||模板]：多条欢迎语随机或顺序发送"""
+        yield event.plain_result(await self.welcome.set_templates(event))
+
+    @filter.command("欢迎图片")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_images(self, event: AstrMessageEvent):
+        """欢迎图片 [URL或路径||...]：欢迎语后附带图片"""
+        yield event.plain_result(await self.welcome.set_images(event))
+
+    @filter.command("欢迎模式")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_mode(self, event: AstrMessageEvent):
+        """欢迎模式 [随机|顺序]：多条模板的选取方式"""
+        yield event.plain_result(await self.welcome.set_mode(event))
+
+    @filter.command("欢迎延迟")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_delay(self, event: AstrMessageEvent):
+        """欢迎延迟 <秒数>：稍后再发欢迎语，范围 0~300"""
+        yield event.plain_result(await self.welcome.set_delay(event))
+
+    @filter.command("入群验证")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_verify(self, event: AstrMessageEvent):
+        """入群验证 [开|关] [超时秒数]：新人答算术题"""
+        yield event.plain_result(await self.welcome.toggle_verify(event))
+
+    @filter.command("验证动作")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_verify_action(self, event: AstrMessageEvent):
+        """验证动作 [踢出|踢出并拉黑|仅提醒]：验证失败后的处理"""
+        yield event.plain_result(await self.welcome.set_verify_action(event))
+
+    @filter.command("验证次数")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_verify_attempts(self, event: AstrMessageEvent):
+        """验证次数 <0~10>：最多答错几次，0 表示不限"""
+        yield event.plain_result(await self.welcome.set_verify_attempts(event))
+
+    @filter.command("欢迎测试")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_test(self, event: AstrMessageEvent):
+        """欢迎测试：按当前配置预览欢迎效果"""
+        result = await self.welcome.test(event)
+        if isinstance(result, list):
+            yield event.chain_result(result)
+        else:
+            yield event.plain_result(result)
+
+    @filter.command("欢迎配置")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_config(self, event: AstrMessageEvent):
+        """欢迎配置：查看模板、图片、延迟与验证设置"""
+        yield event.plain_result(await self.welcome.config_text(event))
 
     @filter.command("退群通知")
     @perm_required(PermLevel.MEMBER, perm_key="leave")
@@ -794,8 +855,25 @@ class QunStewardPlugin(Star):
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
+    async def on_welcome_verify_reply(self, event: AstrMessageEvent):
+        """入群验证答案：只处理待验证新人的纯数字回复"""
+        result = await self.welcome.check_reply(event)
+        if isinstance(result, list):
+            yield event.chain_result(result)
+        elif result:
+            yield event.plain_result(result)
+
+    @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)
+    @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_notice(self, event: AstrMessageEvent):
-        """进群申请 / 进群 / 退群事件"""
+        """进群欢迎、进群申请与退群事件"""
+        result = await self.welcome.handle_notice(event)
+        if isinstance(result, list):
+            yield event.chain_result(result)
+            return
+        if result:
+            yield event.plain_result(result)
+            return
         if result := await self.join.event_monitoring(event):
             yield event.plain_result(result)
 

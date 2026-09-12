@@ -16,8 +16,9 @@ from astrbot_plugin_qun_steward.features.album.cloud import AlbumCloud, PickedIm
 from astrbot_plugin_qun_steward.features.album.service import AlbumFeature
 from astrbot_plugin_qun_steward.features.base import FeatureContext
 from astrbot_plugin_qun_steward.features.files import FilesFeature
-from astrbot_plugin_qun_steward.features.join import _normalize_requests, _WelcomeValues
+from astrbot_plugin_qun_steward.features.join import _normalize_requests
 from astrbot_plugin_qun_steward.features.voice import VoiceFeature, _flatten_characters
+from astrbot_plugin_qun_steward.features.welcome import _SafeValues
 
 GID = "10001"
 
@@ -145,7 +146,7 @@ class TestNormalizeRequests:
 
 
 def test_unknown_welcome_placeholders_are_preserved() -> None:
-    values = _WelcomeValues(
+    values = _SafeValues(
         nickname="小明", group_name="测试群", user_id="12345"
     )
     assert "小明" in "{nickname} 欢迎加入 {group_name}（{user_id}）".format_map(values)
