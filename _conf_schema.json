@@ -57,6 +57,12 @@
         "type": "string",
         "default": ""
       },
+      "welcome_enabled": {
+        "description": "欢迎开关",
+        "hint": "只控制是否发送欢迎消息；关闭后模板和图片保留，入群验证不受影响。可全局默认关闭，再按群覆写开启。",
+        "type": "bool",
+        "default": true
+      },
       "welcome_templates": {
         "description": "欢迎模板",
         "hint": "支持 {at}（@新人）、{nickname}、{group_name}、{member_count}、{join_time} 等占位符。多条模板用「||」分隔；非空时优先于旧「进群欢迎词」。",

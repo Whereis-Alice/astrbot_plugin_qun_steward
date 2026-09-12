@@ -618,6 +618,12 @@ class QunStewardPlugin(Star):
         """进群欢迎 <欢迎语>：兼容旧的单条欢迎语设置"""
         yield event.plain_result(await self.welcome.set_legacy_text(event))
 
+    @filter.command("欢迎开关")
+    @perm_required(PermLevel.ADMIN, perm_key="welcome")
+    async def cmd_welcome_enabled(self, event: AstrMessageEvent):
+        """欢迎开关 [开|关]：按群控制欢迎消息，不影响入群验证"""
+        yield event.plain_result(await self.welcome.toggle_enabled(event))
+
     @filter.command("欢迎模板")
     @perm_required(PermLevel.ADMIN, perm_key="welcome")
     async def cmd_welcome_templates(self, event: AstrMessageEvent):

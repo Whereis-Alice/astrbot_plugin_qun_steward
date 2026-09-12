@@ -29,6 +29,7 @@ FIELD_LABELS: dict[str, str] = {
     "reject_word_block": "命中黑词拉黑",
     "block_ids": "进群黑名单",
     "join_welcome": "进群欢迎词",
+    "welcome_enabled": "欢迎开关",
     "welcome_templates": "欢迎模板",
     "welcome_mode": "欢迎模式",
     "welcome_images": "欢迎图片",

@@ -21,6 +21,7 @@ GID = "10001"
 UID = "20002"
 BOT_ID = "30003"
 WELCOME_FIELDS = (
+    "welcome_enabled",
     "welcome_templates",
     "welcome_mode",
     "welcome_images",
@@ -255,6 +256,98 @@ class TestWelcomeNotice:
         assert "2 + 3" in result[1].text
         assert event.bot.ban_calls == []
         assert welcome._pending[(GID, UID)].answer == 5
+
+
+class TestWelcomeSwitch:
+    async def test_disabled_welcome_still_applies_join_ban(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "welcome_enabled": False,
+                "join_welcome": "欢迎",
+                "join_ban_time": 60,
+            },
+        )
+        event = _increase_event()
+
+        assert await welcome.handle_notice(event) is None
+        assert event.bot.ban_calls == [
+            {"group_id": int(GID), "user_id": int(UID), "duration": 60}
+        ]
+
+    async def test_verification_is_independent_from_welcome_switch(
+        self,
+        welcome: WelcomeFeature,
+        store: GroupStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "welcome_enabled": False,
+                "welcome_verify": True,
+                "join_welcome": "欢迎",
+            },
+        )
+        monkeypatch.setattr(welcome, "_make_question", lambda: ("2 + 3", 5))
+        event = _increase_event()
+
+        question = await welcome.handle_notice(event)
+        assert isinstance(question, list)
+        assert "2 + 3" in question[1].text
+
+        assert await welcome.check_reply(_Event(message_str="5")) == "验证通过。"
+        assert welcome._pending == {}
+
+    async def test_setting_templates_enables_welcome_for_that_group(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "welcome_enabled", False)
+        event = _Event(message_str="欢迎模板 {at} 你好")
+
+        message = await welcome.set_templates(event)
+
+        assert "已覆写" in message
+        assert store.value(GID, "welcome_enabled") is True
+        assert isinstance(await welcome.handle_notice(_increase_event()), list)
+
+    async def test_toggle_preserves_templates_and_reports_status(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.update(GID, {"welcome_templates": ["欢迎"], "welcome_enabled": True})
+
+        off = await welcome.toggle_enabled(_Event(message_str="欢迎开关 关"))
+        status = await welcome.toggle_enabled(_Event(message_str="欢迎开关"))
+        on = await welcome.toggle_enabled(_Event(message_str="欢迎开关 开"))
+
+        assert "已关闭" in off
+        assert "本群欢迎消息：关" in status
+        assert store.value(GID, "welcome_templates") == ["欢迎"]
+        assert "已开启" in on
+        assert store.value(GID, "welcome_enabled") is True
+
+    async def test_delayed_task_respects_switch_turned_off_while_waiting(
+        self,
+        welcome: WelcomeFeature,
+        store: GroupStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await store.update(GID, {"join_welcome": "迟到 welcome", "welcome_delay": 5})
+        event = _increase_event()
+
+        assert await welcome.handle_notice(event) is None
+        await store.set(GID, "welcome_enabled", False)
+
+        async def fast_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(welcome_mod.asyncio, "sleep", fast_sleep)
+        tasks = list(welcome._tasks)
+        assert tasks
+        await asyncio.gather(*tasks)
+        assert event.sent == []
 
 
 class TestVerification:

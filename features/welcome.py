@@ -2,6 +2,7 @@
 
 设计原则：
 * 旧 ``join_welcome`` 继续可用，新 ``welcome_templates`` 非空时优先；
+* ``welcome_enabled`` 只控制欢迎消息，入群验证独立开关；
 * 消息一律使用 AstrBot message components，不拼 CQ 码；
 * 延迟发送和验证超时任务都由本模块持有，插件卸载时统一取消；
 * 验证答案必须是纯数字，避免把「今天是 3 号」这类话误判成回答。
@@ -108,13 +109,15 @@ class WelcomeFeature(Feature):
     async def handle_increase(
         self, event: AstrMessageEvent, group_id: str, user_id: str
     ) -> list[Any] | str | None:
-        """处理 group_increase：验证优先，未开启验证时直接欢迎。"""
+        """处理 group_increase：验证优先；未验证时按欢迎开关发送。"""
         if parse_bool(self.store.value(group_id, "welcome_verify"), False):
             return await self._start_verification(event, group_id, user_id)
 
         # 开启验证时不能先禁言：新人被禁言后无法回答问题。这里宁可跳过
         # 「进群禁言」，也不要生成一个永远无法通过的验证。
         await self._apply_join_ban(event, group_id, user_id)
+        if not self._enabled(group_id):
+            return None
         return await self._welcome_or_schedule(event, group_id, user_id)
 
     async def check_reply(self, event: AstrMessageEvent) -> list[Any] | str | None:
@@ -154,6 +157,8 @@ class WelcomeFeature(Feature):
             detail=pending.question + " = " + str(pending.answer),
             source="event",
         )
+        if not self._enabled(group_id):
+            return "验证通过。"
         result = await self._welcome_or_schedule(event, group_id, user_id)
         if result is None:
             return "验证通过，欢迎加入本群！"
@@ -168,6 +173,8 @@ class WelcomeFeature(Feature):
         self, event: AstrMessageEvent, group_id: str, user_id: str
     ) -> list[Any] | None:
         """构建欢迎消息；配置了延迟时转入后台发送。"""
+        if not self._enabled(group_id):
+            return None
         chain = await self.build_welcome(event, group_id, user_id)
         if not chain:
             return None
@@ -182,6 +189,9 @@ class WelcomeFeature(Feature):
     ) -> None:
         try:
             await asyncio.sleep(delay)
+            # 延迟期间管理员关闭欢迎时，不再补发这条旧欢迎。
+            if not self._enabled(event.get_group_id()):
+                return
             await event.send(event.chain_result(chain))
         except asyncio.CancelledError:
             raise
@@ -225,6 +235,17 @@ class WelcomeFeature(Feature):
                 return templates[index]
             return random.choice(templates)
         return str(self.store.value(group_id, "join_welcome") or "")
+
+    def _enabled(self, group_id: str) -> bool:
+        return parse_bool(self.store.value(group_id, "welcome_enabled"), True)
+
+    def _has_template(self, group_id: str) -> bool:
+        templates = [
+            str(item)
+            for item in self.store.value(group_id, "welcome_templates") or []
+            if str(item).strip()
+        ]
+        return bool(templates or str(self.store.value(group_id, "join_welcome") or ""))
 
     async def _placeholder_values(
         self,
@@ -503,7 +524,9 @@ class WelcomeFeature(Feature):
             await self.store.set(group_id, "join_welcome", "")
             await self.log(event, "join_welcome", detail="清空")
             return "已清空兼容欢迎语"
-        await self.store.set(group_id, "join_welcome", raw)
+        await self.store.update(
+            group_id, {"join_welcome": raw, "welcome_enabled": True}
+        )
         await self.log(event, "join_welcome", detail=raw)
         placeholders = ("{at}", "{nickname}", "{昵称}", "{group_name}", "{群名}")
         tip = "" if any(item in raw for item in placeholders) else (
@@ -512,13 +535,20 @@ class WelcomeFeature(Feature):
         return f"兼容欢迎语已设置。多模板请用「欢迎模板」。{tip}"
 
     async def set_templates(self, event: AstrMessageEvent) -> str:
-        return await self._edit_string_list(event, "welcome_templates", "欢迎模板")
+        return await self._edit_string_list(
+            event, "welcome_templates", "欢迎模板", enable_on_content=True
+        )
 
     async def set_images(self, event: AstrMessageEvent) -> str:
         return await self._edit_string_list(event, "welcome_images", "欢迎图片")
 
     async def _edit_string_list(
-        self, event: AstrMessageEvent, field: str, label: str
+        self,
+        event: AstrMessageEvent,
+        field: str,
+        label: str,
+        *,
+        enable_on_content: bool = False,
     ) -> str:
         group_id = event.get_group_id()
         raw = rest_of(event)
@@ -552,13 +582,36 @@ class WelcomeFeature(Feature):
         else:
             current = [item.strip() for item in raw.split("||") if item.strip()]
 
-        await self.store.set(group_id, field, current)
+        changes: dict[str, Any] = {field: current}
+        if enable_on_content and current:
+            # 全局默认关闭时，管理员在某个群写模板通常就是想启用该群欢迎。
+            changes["welcome_enabled"] = True
+        await self.store.update(group_id, changes)
         await self.log(event, field, detail=f"{len(current)} 项")
         if added:
             return f"已新增 {len(added)} 条{label}，当前共 {len(current)} 条。"
         if removed:
             return f"已移除{label}：{removed[0]}，当前共 {len(current)} 条。"
         return f"已覆写{label}，当前共 {len(current)} 条。"
+
+    async def toggle_enabled(self, event: AstrMessageEvent) -> str:
+        """按群开关欢迎消息；模板与验证配置都保留。"""
+        group_id = event.get_group_id()
+        raw = rest_of(event)
+        mode = parse_bool(raw)
+        if mode is None:
+            return (
+                f"本群欢迎消息：{switch_text(self._enabled(group_id))}\n"
+                "入群验证独立控制，不受此开关影响。"
+            )
+
+        await self.store.set(group_id, "welcome_enabled", mode)
+        await self.log(event, "welcome_enabled", detail=switch_text(mode))
+        if not mode:
+            return "已关闭本群欢迎消息。模板和图片配置保留，入群验证不受影响。"
+        if not self._has_template(group_id):
+            return "已开启本群欢迎消息，但还没有配置欢迎模板或兼容欢迎语。"
+        return "已开启本群欢迎消息。"
 
     async def set_mode(self, event: AstrMessageEvent) -> str:
         group_id = event.get_group_id()
@@ -641,6 +694,8 @@ class WelcomeFeature(Feature):
         group_id = event.get_group_id()
         if not group_id:
             return "欢迎测试只能在群里使用。"
+        if not self._enabled(group_id):
+            return "本群欢迎消息已关闭。开启请用「欢迎开关 开」。"
         targets = resolve_targets(event)
         user_id = targets[0] if targets else str(event.get_sender_id())
         chain = await self.build_welcome(event, group_id, user_id)
@@ -660,7 +715,11 @@ class WelcomeFeature(Feature):
         legacy = str(self.store.value(group_id, "join_welcome") or "")
         lines = [
             f"【欢迎配置】群 {group_id}",
-            f"模板模式：{self.store.value(group_id, 'welcome_mode')}；延迟：{self._delay(group_id)} 秒",
+            (
+                f"欢迎消息：{switch_text(self._enabled(group_id))}；"
+                f"模板模式：{self.store.value(group_id, 'welcome_mode')}；"
+                f"延迟：{self._delay(group_id)} 秒"
+            ),
             f"兼容单条欢迎语：{legacy or '（未设置）'}",
             "欢迎模板：" + (list_text(templates, "（空）") if templates else "（空，使用兼容单条欢迎语）"),
             "欢迎图片：" + list_text(images),

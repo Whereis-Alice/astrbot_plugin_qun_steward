@@ -31,6 +31,7 @@ GROUP_DEFAULTS: dict[str, Any] = {
     "reject_word_block": False,
     "block_ids": [],
     "join_welcome": "",
+    "welcome_enabled": True,
     "welcome_templates": [],
     "welcome_mode": "随机",
     "welcome_images": [],
