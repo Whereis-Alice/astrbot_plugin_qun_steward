@@ -31,6 +31,13 @@ WELCOME_FIELDS = (
     "welcome_verify_max_attempts",
     "welcome_verify_timeout_action",
 )
+LEAVE_FIELDS = (
+    "leave_farewell_enabled",
+    "leave_farewell_templates",
+    "leave_farewell_mode",
+    "leave_farewell_images",
+    "leave_farewell_delay",
+)
 
 
 async def _to_image(_markdown: str) -> str:
@@ -131,6 +138,20 @@ def _increase_event(**raw: Any) -> _Event:
         "user_id": int(UID),
         "group_name": "通知群名",
         "member_count": 66,
+    }
+    payload.update(raw)
+    return _Event(raw_message=payload)
+
+
+def _leave_event(**raw: Any) -> _Event:
+    payload: dict[str, Any] = {
+        "post_type": "notice",
+        "notice_type": "group_decrease",
+        "sub_type": "leave",
+        "group_id": int(GID),
+        "user_id": int(UID),
+        "group_name": "通知群名",
+        "member_count": 65,
     }
     payload.update(raw)
     return _Event(raw_message=payload)
@@ -312,6 +333,19 @@ class TestWelcomeSwitch:
         assert "已覆写" in message
         assert store.value(GID, "welcome_enabled") is True
         assert isinstance(await welcome.handle_notice(_increase_event()), list)
+
+    async def test_command_template_pipe_separator_creates_multiple_templates(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        event = _Event(message_str="欢迎模板 欢迎 {nickname}||今天 {member_count} 人")
+
+        message = await welcome.set_templates(event)
+
+        assert "当前共 2 条" in message
+        assert store.value(GID, "welcome_templates") == [
+            "欢迎 {nickname}",
+            "今天 {member_count} 人",
+        ]
 
     async def test_toggle_preserves_templates_and_reports_status(
         self, welcome: WelcomeFeature, store: GroupStore
@@ -530,6 +564,215 @@ class TestWelcomeTasks:
         assert welcome._pending == {}
 
 
+class TestLeaveFarewell:
+    async def test_disabled_by_default(
+        self, welcome: WelcomeFeature, group_defaults: dict[str, Any]
+    ) -> None:
+        assert group_defaults["leave_farewell_enabled"] is False
+        assert await welcome.leave_event(_leave_event(), GID, UID) is None
+
+    async def test_default_template_and_placeholders(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "leave_farewell_enabled", True)
+
+        chain = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+
+        assert isinstance(chain[0], Comp.Plain)
+        assert chain[0].text == "阿狸(20002) 离开了 通知群名，江湖再见。"
+
+    async def test_custom_templates_and_sequence_mode(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_templates": ["A", "B"],
+                "leave_farewell_mode": "顺序",
+            },
+        )
+
+        first = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+        second = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+        third = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+
+        assert [first[0].text, second[0].text, third[0].text] == ["A", "B", "A"]
+
+    async def test_old_pipe_data_is_normalized_when_reading(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_templates": ["A||B", " C "],
+                "leave_farewell_mode": "顺序",
+            },
+        )
+
+        first = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+        second = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+        third = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+
+        assert [first[0].text, second[0].text, third[0].text] == ["A", "B", "C"]
+
+    async def test_image_sources(
+        self,
+        welcome: WelcomeFeature,
+        store: GroupStore,
+        tmp_path: Path,
+    ) -> None:
+        target = tmp_path / "bye.png"
+        target.write_bytes(b"png")
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_images": [
+                    "https://example.com/bye.png",
+                    str(target),
+                    "file:///" + target.as_posix(),
+                ],
+            },
+        )
+
+        chain = await welcome.build_leave_farewell(_leave_event(), GID, UID)
+
+        assert [type(item) for item in chain[1:]] == [Comp.Image] * 3
+        assert chain[1].file == "https://example.com/bye.png"
+        assert Path(chain[2].path).resolve() == target.resolve()
+        assert Path(chain[3].path).resolve() == target.resolve()
+
+    async def test_command_pipe_separator_and_auto_enable(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "leave_farewell_enabled", False)
+
+        templates = await welcome.set_leave_templates(
+            _Event(message_str="退群告别模板 一路顺风||江湖再见")
+        )
+        images = await welcome.set_leave_images(
+            _Event(message_str="退群告别图片 https://example.com/bye.png")
+        )
+
+        assert "当前共 2 条" in templates
+        assert store.value(GID, "leave_farewell_templates") == ["一路顺风", "江湖再见"]
+        assert images
+        assert store.value(GID, "leave_farewell_images") == [
+            "https://example.com/bye.png"
+        ]
+        assert store.value(GID, "leave_farewell_enabled") is True
+
+    async def test_config_text_normalizes_old_welcome_data(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.update(
+            GID,
+            {"welcome_templates": ["A||B", " C "], "welcome_images": ["u1||u2"]},
+        )
+
+        text = await welcome.config_text(_Event())
+
+        assert "A、B、C" in text
+        assert "u1、u2" in text
+
+    async def test_delayed_farewell_is_sent_by_background_task(
+        self,
+        welcome: WelcomeFeature,
+        store: GroupStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_templates": ["迟到告别"],
+                "leave_farewell_delay": 5,
+            },
+        )
+
+        async def fast_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(welcome_mod.asyncio, "sleep", fast_sleep)
+        event = _leave_event()
+        assert await welcome.leave_event(event, GID, UID) == []
+        tasks = list(welcome._tasks)
+        assert tasks
+        await asyncio.gather(*tasks)
+        assert event.sent and event.sent[0][0] == "chain"
+        assert event.sent[0][1][0].text == "迟到告别"
+
+    async def test_delayed_farewell_respects_switch_turned_off_while_waiting(
+        self,
+        welcome: WelcomeFeature,
+        store: GroupStore,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_templates": ["不会发出"],
+                "leave_farewell_delay": 5,
+            },
+        )
+        event = _leave_event()
+        assert await welcome.leave_event(event, GID, UID) == []
+        await store.set(GID, "leave_farewell_enabled", False)
+
+        async def fast_sleep(_seconds: float) -> None:
+            return None
+
+        monkeypatch.setattr(welcome_mod.asyncio, "sleep", fast_sleep)
+        tasks = list(welcome._tasks)
+        assert tasks
+        await asyncio.gather(*tasks)
+        assert event.sent == []
+
+    async def test_shutdown_cancels_delayed_farewell(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_templates": ["不会发出"],
+                "leave_farewell_delay": 30,
+            },
+        )
+        event = _leave_event()
+
+        assert await welcome.leave_event(event, GID, UID) == []
+        task = next(iter(welcome._tasks))
+        await welcome.shutdown()
+
+        assert task.cancelled() or task.done()
+        assert event.sent == []
+
+    async def test_leave_test_does_not_send_or_wait(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_templates": ["预览告别"],
+                "leave_farewell_delay": 3,
+            },
+        )
+        event = _Event()
+
+        result = await welcome.leave_test(event)
+
+        assert isinstance(result, list)
+        assert "实际会延迟 3 秒" in result[0].text
+        assert "预览告别" in result[1].text
+        assert event.sent == []
+        assert welcome._tasks == set()
+
+
 class TestWelcomeConfigurationSurface:
     def test_schema_store_and_test_defaults_are_in_sync(
         self, plugin_dir: Path, group_defaults: dict[str, Any]
@@ -541,6 +784,22 @@ class TestWelcomeConfigurationSurface:
             assert field in FIELD_LABELS
             assert field in items
             assert items[field]["default"] == group_defaults[field]
+        assert items["welcome_templates"]["list_style"] == "text"
+        assert items["welcome_images"]["list_style"] == "text"
+
+    def test_schema_store_and_test_leave_defaults_are_in_sync(
+        self, plugin_dir: Path, group_defaults: dict[str, Any]
+    ) -> None:
+        schema = json.loads((plugin_dir / "_conf_schema.json").read_text(encoding="utf-8"))
+        items = schema["default"]["items"]
+
+        for field in LEAVE_FIELDS:
+            assert field in FIELD_LABELS
+            assert field in items
+            assert items[field]["default"] == group_defaults[field]
+        assert items["leave_farewell_enabled"]["default"] is False
+        assert items["leave_farewell_templates"]["list_style"] == "text"
+        assert items["leave_farewell_images"]["list_style"] == "text"
 
     def test_webui_renders_welcome_fields(
         self, store: GroupStore, make_config: Any
@@ -560,6 +819,8 @@ class TestWelcomeConfigurationSurface:
         fields = {item["field"]: item for item in service.fields()}
 
         assert set(WELCOME_FIELDS) <= set(fields)
+        assert set(LEAVE_FIELDS) <= set(fields)
         assert fields["welcome_templates"]["type"] == "list"
+        assert fields["welcome_templates"]["list_style"] == "text"
         assert fields["welcome_verify"]["type"] == "bool"
         assert fields["welcome_images"]["hint"]

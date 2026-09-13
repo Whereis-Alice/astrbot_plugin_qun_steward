@@ -41,6 +41,11 @@ FIELD_LABELS: dict[str, str] = {
     "join_ban_time": "进群禁言时长",
     "leave_notify": "主动退群通知",
     "leave_block": "主动退群拉黑",
+    "leave_farewell_enabled": "退群告别开关",
+    "leave_farewell_templates": "退群告别模板",
+    "leave_farewell_mode": "退群告别模式",
+    "leave_farewell_images": "退群告别图片",
+    "leave_farewell_delay": "退群告别延迟秒数",
     "builtin_ban": "启用内置禁词",
     "custom_ban_words": "自定义违禁词",
     "word_ban_time": "禁词禁言时长",
@@ -58,6 +63,16 @@ FIELD_LABELS: dict[str, str] = {
 LABEL_FIELDS: dict[str, str] = {label: field for field, label in FIELD_LABELS.items()}
 
 _TRUE_LABELS = frozenset({"开", "开启", "启用", "true", "1", "是"})
+# 这些列表项本身是「一段文本」而不是一组短词，导入导出必须保留空格。
+# 因此用 || 分隔，不能沿用普通列表的空格分隔。
+TEXT_LIST_FIELDS = frozenset(
+    {
+        "welcome_templates",
+        "welcome_images",
+        "leave_farewell_templates",
+        "leave_farewell_images",
+    }
+)
 
 
 class GroupStore:
@@ -175,7 +190,7 @@ class GroupStore:
         for field, label in FIELD_LABELS.items():
             if field not in snapshot:
                 continue
-            lines.append(f"{label}: {self._to_text(snapshot[field])}")
+            lines.append(f"{label}: {self._to_text(field, snapshot[field])}")
         return "\n".join(lines)
 
     async def import_lines(self, group_id: Any, text: str) -> tuple[list[str], list[str]]:
@@ -208,10 +223,12 @@ class GroupStore:
         return line, "", ""
 
     @staticmethod
-    def _to_text(value: Any) -> str:
+    def _to_text(field: str, value: Any) -> str:
         if isinstance(value, bool):
             return "开" if value else "关"
         if isinstance(value, (list, tuple)):
+            if field in TEXT_LIST_FIELDS:
+                return "||".join(str(item) for item in value)
             return " ".join(str(item) for item in value)
         if isinstance(value, dict):
             return json.dumps(value, ensure_ascii=False)
@@ -222,6 +239,8 @@ class GroupStore:
         if isinstance(reference, bool):
             return text.strip().lower() in _TRUE_LABELS
         if isinstance(reference, list):
+            if field in TEXT_LIST_FIELDS:
+                return [item.strip() for item in text.split("||") if item.strip()]
             return [token for token in text.replace("、", " ").split() if token]
         if isinstance(reference, int):
             try:

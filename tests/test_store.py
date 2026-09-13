@@ -151,6 +151,48 @@ class TestTextImportExport:
         assert unknown == []
         assert len(updated) == 2
 
+    async def test_text_list_roundtrip_preserves_spaces(self, store: GroupStore) -> None:
+        templates = ["欢迎 {nickname} 加入 {group_name}", "第二句 {member_count}"]
+        await store.set(GID, "welcome_templates", templates)
+        exported = store.export_lines(GID)
+
+        assert "欢迎模板: 欢迎 {nickname} 加入 {group_name}||第二句 {member_count}" in exported
+        await store.follow_default(GID)
+        updated, unknown = await store.import_lines(GID, exported)
+
+        assert unknown == []
+        assert "欢迎模板" in updated
+        assert store.value(GID, "welcome_templates") == templates
+
+    async def test_leave_farewell_text_lists_roundtrip(self, store: GroupStore) -> None:
+        templates = ["{nickname} 离开了 {group_name}", "一路顺风"]
+        images = ["https://example.com/bye.png", "file:///D:/images/bye.png"]
+        await store.update(
+            GID,
+            {
+                "leave_farewell_enabled": True,
+                "leave_farewell_templates": templates,
+                "leave_farewell_images": images,
+            },
+        )
+        exported = store.export_lines(GID)
+
+        assert "退群告别开关: 开" in exported
+        assert "退群告别模板: {nickname} 离开了 {group_name}||一路顺风" in exported
+        assert (
+            "退群告别图片: https://example.com/bye.png||file:///D:/images/bye.png"
+            in exported
+        )
+
+        await store.follow_default(GID)
+        updated, unknown = await store.import_lines(GID, exported)
+
+        assert unknown == []
+        assert {"退群告别开关", "退群告别模板", "退群告别图片"} <= set(updated)
+        assert store.value(GID, "leave_farewell_enabled") is True
+        assert store.value(GID, "leave_farewell_templates") == templates
+        assert store.value(GID, "leave_farewell_images") == images
+
     async def test_import_keeps_reference_on_bad_number(self, store: GroupStore) -> None:
         await store.import_lines(GID, "进群等级门槛: 一大堆")
         assert store.value(GID, "join_min_level") == 8

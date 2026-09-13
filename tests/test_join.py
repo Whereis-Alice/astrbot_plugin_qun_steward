@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from astrbot.core.message.components import Plain, Reply
+from astrbot_plugin_qun_steward.core.audit import AuditLog
 from astrbot_plugin_qun_steward.core.protocol import clear_backend_cache
 from astrbot_plugin_qun_steward.core.store import GroupStore
 from astrbot_plugin_qun_steward.features.base import FeatureContext
@@ -30,7 +31,7 @@ async def join(store: GroupStore, database: Any, make_config: ConfigFactory) -> 
         config=make_config(),
         store=store,
         permissions=None,  # type: ignore[arg-type]
-        audit=None,  # type: ignore[arg-type]
+        audit=AuditLog(database, make_config()),
         undo=None,  # type: ignore[arg-type]
         groups=None,  # type: ignore[arg-type]
         db=database,
@@ -214,6 +215,28 @@ def _ok(data: Any = None) -> dict[str, Any]:
     return {"status": "ok", "retcode": 0, "data": data}
 
 
+def _decrease_event(sub_type: str = "leave") -> _JoinEvent:
+    return _JoinEvent(
+        _ProtocolApi("NapCat"),
+        raw_message={
+            "post_type": "notice",
+            "notice_type": "group_decrease",
+            "sub_type": sub_type,
+            "group_id": int(GID),
+            "user_id": int(UID),
+        },
+    )
+
+
+def _farewell(result: list[Any] | None):
+    async def callback(
+        _event: _JoinEvent, _group_id: str, _user_id: str
+    ) -> list[Any] | None:
+        return result
+
+    return callback
+
+
 class TestJoinProtocolSafety:
     async def test_llbot_approval_does_not_send_sub_type(self, join: JoinFeature) -> None:
         api = _ProtocolApi("LLOneBot", {"set_group_add_request": _ok({})})
@@ -319,3 +342,83 @@ class TestJoinProtocolSafety:
 
         assert result == "这条进群申请不属于当前群，拒绝处理"
         assert [name for name, _ in api.calls] == []
+
+
+class TestLeaveEvent:
+    async def test_leave_block_does_not_require_notify(
+        self, join: JoinFeature, store: GroupStore, database: Any
+    ) -> None:
+        await store.set(GID, "leave_block", True)
+        event = _decrease_event()
+
+        assert await join.event_monitoring(event, farewell=_farewell(None)) is None
+
+        assert UID in store.value(GID, "block_ids")
+        rows = await join.audit.query(group_id=GID, action="leave")
+        assert rows and "已加入进群黑名单" in rows[0]["detail"]
+        assert "退群通知" not in rows[0]["detail"]
+
+    async def test_legacy_notify_still_works_without_farewell(
+        self, join: JoinFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "leave_notify", True)
+
+        result = await join.event_monitoring(_decrease_event(), farewell=_farewell(None))
+
+        assert result == "申请人(20002) 主动退群了"
+
+    async def test_farewell_wins_over_legacy_notify(
+        self, join: JoinFeature, store: GroupStore, database: Any
+    ) -> None:
+        await store.set(GID, "leave_notify", True)
+
+        result = await join.event_monitoring(
+            _decrease_event(), farewell=_farewell(["farewell"])
+        )
+
+        assert result == ["farewell"]
+        rows = await join.audit.query(group_id=GID, action="leave")
+        assert rows and "已发送退群告别" in rows[0]["detail"]
+        assert "退群通知" not in rows[0]["detail"]
+
+    async def test_delayed_farewell_returns_none_to_handler(
+        self, join: JoinFeature, store: GroupStore, database: Any
+    ) -> None:
+        await store.set(GID, "leave_notify", True)
+
+        result = await join.event_monitoring(_decrease_event(), farewell=_farewell([]))
+
+        assert result is None
+        rows = await join.audit.query(group_id=GID, action="leave")
+        assert rows and "已安排延迟退群告别" in rows[0]["detail"]
+
+    async def test_farewell_and_leave_block_can_work_together(
+        self, join: JoinFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "leave_block", True)
+
+        result = await join.event_monitoring(
+            _decrease_event(), farewell=_farewell(["farewell"])
+        )
+
+        assert result == ["farewell"]
+        assert UID in store.value(GID, "block_ids")
+
+    async def test_kick_event_does_not_trigger_farewell_or_block(
+        self, join: JoinFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "leave_block", True)
+        called = False
+
+        async def farewell(
+            _event: _JoinEvent, _group_id: str, _user_id: str
+        ) -> list[Any] | None:
+            nonlocal called
+            called = True
+            return ["farewell"]
+
+        result = await join.event_monitoring(_decrease_event("kick"), farewell=farewell)
+
+        assert result is None
+        assert called is False
+        assert UID not in store.value(GID, "block_ids")

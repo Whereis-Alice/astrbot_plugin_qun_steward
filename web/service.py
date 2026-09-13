@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from typing import Any
 
@@ -56,6 +57,12 @@ def _coerce(meta: dict[str, Any], value: Any) -> Any:
         if isinstance(value, list):
             return [str(item).strip() for item in value if str(item).strip()]
         if isinstance(value, str):
+            if str(meta.get("list_style") or "") == "text":
+                return [
+                    item.strip()
+                    for item in re.split(r"\|\||[\r\n]+", value)
+                    if item.strip()
+                ]
             return [tok for tok in value.replace(",", " ").replace("，", " ").split() if tok]
         return []
     if kind == "template_list":
@@ -159,6 +166,7 @@ class StewardWebService:
                     "field": field,
                     "label": label,
                     "type": str(item.get("type") or "string"),
+                    "list_style": str(item.get("list_style") or ""),
                     "description": str(item.get("description") or label),
                     "hint": str(item.get("hint") or ""),
                     "options": item.get("options") or [],

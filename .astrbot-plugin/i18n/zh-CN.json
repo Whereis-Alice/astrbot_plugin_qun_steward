@@ -45,6 +45,7 @@
     "off": "关闭",
     "on": "开启",
     "onePerLine": "每行一项",
+    "onePerLineOrPipe": "每行一条，也可用 || 分隔",
     "query": "查询",
     "ready": "已连接",
     "refresh": "刷新",

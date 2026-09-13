@@ -688,6 +688,52 @@ class QunStewardPlugin(Star):
         """退群通知 开/关：有人主动退群时在群里提示"""
         yield event.plain_result(await self.join.toggle_leave_notify(event, _optional(event)))
 
+    @filter.command("退群告别")
+    @perm_required(PermLevel.ADMIN, perm_key="leave")
+    async def cmd_leave_farewell_enabled(self, event: AstrMessageEvent):
+        """退群告别 [开|关]：自定义主动退群告别消息，默认关闭"""
+        yield event.plain_result(await self.welcome.toggle_leave_farewell(event))
+
+    @filter.command("退群告别模板")
+    @perm_required(PermLevel.ADMIN, perm_key="leave")
+    async def cmd_leave_farewell_templates(self, event: AstrMessageEvent):
+        """退群告别模板 [模板||模板]：留空查看，写「关」清空"""
+        yield event.plain_result(await self.welcome.set_leave_templates(event))
+
+    @filter.command("退群告别图片")
+    @perm_required(PermLevel.ADMIN, perm_key="leave")
+    async def cmd_leave_farewell_images(self, event: AstrMessageEvent):
+        """退群告别图片 [URL或路径||...]：告别语后附带图片"""
+        yield event.plain_result(await self.welcome.set_leave_images(event))
+
+    @filter.command("退群告别模式")
+    @perm_required(PermLevel.ADMIN, perm_key="leave")
+    async def cmd_leave_farewell_mode(self, event: AstrMessageEvent):
+        """退群告别模式 [随机|顺序]：多条模板的选取方式"""
+        yield event.plain_result(await self.welcome.set_leave_mode(event))
+
+    @filter.command("退群告别延迟")
+    @perm_required(PermLevel.ADMIN, perm_key="leave")
+    async def cmd_leave_farewell_delay(self, event: AstrMessageEvent):
+        """退群告别延迟 <秒数>：稍后再发告别语，范围 0~300"""
+        yield event.plain_result(await self.welcome.set_leave_delay(event))
+
+    @filter.command("退群告别测试")
+    @perm_required(PermLevel.ADMIN, perm_key="leave")
+    async def cmd_leave_farewell_test(self, event: AstrMessageEvent):
+        """退群告别测试：按当前配置预览告别效果"""
+        result = await self.welcome.leave_test(event)
+        if isinstance(result, list):
+            yield event.chain_result(result)
+        else:
+            yield event.plain_result(result)
+
+    @filter.command("退群告别配置")
+    @perm_required(PermLevel.ADMIN, perm_key="leave")
+    async def cmd_leave_farewell_config(self, event: AstrMessageEvent):
+        """退群告别配置：查看模板、图片、模式与延迟设置"""
+        yield event.plain_result(await self.welcome.leave_config_text(event))
+
     @filter.command("退群拉黑")
     @perm_required(PermLevel.ADMIN, perm_key="leave")
     async def cmd_leave_block(self, event: AstrMessageEvent):
@@ -880,7 +926,12 @@ class QunStewardPlugin(Star):
         if result:
             yield event.plain_result(result)
             return
-        if result := await self.join.event_monitoring(event):
+        result = await self.join.event_monitoring(
+            event, farewell=self.welcome.leave_event
+        )
+        if isinstance(result, list):
+            yield event.chain_result(result)
+        elif result:
             yield event.plain_result(result)
 
     @filter.platform_adapter_type(filter.PlatformAdapterType.AIOCQHTTP)

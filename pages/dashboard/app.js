@@ -153,8 +153,10 @@
     return String(value);
   }
 
-  function textToList(text) {
-    return String(text || "")
+  function textToList(text, allowPipe) {
+    var raw = String(text || "");
+    if (allowPipe) raw = raw.split("||").join("\n");
+    return raw
       .split(/[\r\n]+/)
       .map(function (line) { return line.trim(); })
       .filter(function (line) { return line.length > 0; });
@@ -195,8 +197,18 @@
       };
     }
     if (type === "list") {
-      input = el("textarea", { value: listToText(value), placeholder: t("common.onePerLine", "每行一项") });
-      return { node: input, read: function () { return textToList(input.value); }, onChange: function (fn) { input.addEventListener("input", fn); } };
+      var textList = String(meta.list_style || "") === "text";
+      input = el("textarea", {
+        value: listToText(value),
+        placeholder: textList
+          ? t("common.onePerLineOrPipe", "每行一条，也可用 || 分隔")
+          : t("common.onePerLine", "每行一项")
+      });
+      return {
+        node: input,
+        read: function () { return textToList(input.value, textList); },
+        onChange: function (fn) { input.addEventListener("input", fn); }
+      };
     }
     if (type === "text") {
       input = el("textarea", { value: value === null || value === undefined ? "" : String(value) });

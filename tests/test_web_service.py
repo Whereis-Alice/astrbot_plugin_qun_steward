@@ -52,6 +52,14 @@ class TestCoerceList:
     def test_text_input_is_split(self, raw: str) -> None:
         assert _coerce({"type": "list"}, raw) == ["a", "b"]
 
+    @pytest.mark.parametrize(
+        "raw",
+        ["第一句 保留空格||第二句", "第一句 保留空格\n第二句", " 第一句 保留空格 || 第二句 "],
+    )
+    def test_text_list_input_preserves_spaces(self, raw: str) -> None:
+        meta = {"type": "list", "list_style": "text"}
+        assert _coerce(meta, raw) == ["第一句 保留空格", "第二句"]
+
     @pytest.mark.parametrize("raw", [None, 0, {}])
     def test_other_types_become_empty(self, raw: Any) -> None:
         assert _coerce({"type": "list"}, raw) == []

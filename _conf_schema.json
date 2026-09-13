@@ -65,8 +65,9 @@
       },
       "welcome_templates": {
         "description": "欢迎模板",
-        "hint": "支持 {at}（@新人）、{nickname}、{group_name}、{member_count}、{join_time} 等占位符。多条模板用「||」分隔；非空时优先于旧「进群欢迎词」。",
+        "hint": "支持 {at}（@新人）、{nickname}、{group_name}、{member_count}、{join_time} 等占位符。WebUI 每行一条，也可用「||」分隔；群内指令用「||」分隔。非空时优先于旧「进群欢迎词」。",
         "type": "list",
+        "list_style": "text",
         "default": []
       },
       "welcome_mode": {
@@ -81,8 +82,9 @@
       },
       "welcome_images": {
         "description": "欢迎图片",
-        "hint": "支持图片 URL、本地路径或 file:// 路径，可配置多张并按顺序追加到欢迎语后。",
+        "hint": "支持图片 URL、本地路径或 file:// 路径，可配置多张并按顺序追加到欢迎语后。WebUI 每行一张，也可用「||」分隔。",
         "type": "list",
+        "list_style": "text",
         "default": []
       },
       "welcome_delay": {
@@ -150,6 +152,47 @@
         "description": "主动退群自动拉黑",
         "type": "bool",
         "default": false
+      },
+      "leave_farewell_enabled": {
+        "description": "退群告别消息",
+        "hint": "默认关闭。开启后主动退群时发送自定义告别消息；未配置模板时使用内置文案。会优先于「主动退群通知」，「主动退群自动拉黑」仍独立生效。",
+        "type": "bool",
+        "default": false
+      },
+      "leave_farewell_templates": {
+        "description": "退群告别模板",
+        "hint": "支持 {nickname}、{user_id}、{group_name}、{member_count}、{leave_time} 等占位符。WebUI 每行一条，也可用「||」分隔；群内指令用「||」分隔。留空时使用内置告别文案。",
+        "type": "list",
+        "list_style": "text",
+        "default": []
+      },
+      "leave_farewell_mode": {
+        "description": "退群告别模式",
+        "hint": "随机=每次随机选一条；顺序=按顺序轮播。",
+        "type": "string",
+        "default": "随机",
+        "options": [
+          "随机",
+          "顺序"
+        ]
+      },
+      "leave_farewell_images": {
+        "description": "退群告别图片",
+        "hint": "支持图片 URL、本地路径或 file:// 路径，可配置多张并按顺序追加到告别语后。WebUI 每行一张，也可用「||」分隔。",
+        "type": "list",
+        "list_style": "text",
+        "default": []
+      },
+      "leave_farewell_delay": {
+        "description": "退群告别延迟秒数",
+        "hint": "0 表示立即发送，范围 0~300 秒。延迟期间关闭本群告别后，到期不会补发。",
+        "type": "int",
+        "default": 0,
+        "slider": {
+          "min": 0,
+          "max": 300,
+          "step": 1
+        }
       },
       "builtin_ban": {
         "description": "启用内置禁词表",
@@ -874,7 +917,7 @@
         ]
       },
       "leave": {
-        "description": "退群通知 / 退群拉黑",
+        "description": "退群通知 / 退群告别 / 退群拉黑",
         "type": "string",
         "default": "管理员",
         "options": [

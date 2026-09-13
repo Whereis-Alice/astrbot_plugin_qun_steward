@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import time
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from astrbot.api import logger
@@ -585,8 +586,18 @@ class JoinFeature(Feature):
         return f"已拒绝 {nickname}({target_id}) 进群{suffix}"
 
     # ------------------------------------------------------- 事件监听 --- #
-    async def event_monitoring(self, event: AstrMessageEvent) -> str | None:
-        """监听进群申请 / 退群。返回需要在群里说的话。"""
+    async def event_monitoring(
+        self,
+        event: AstrMessageEvent,
+        farewell: Callable[
+            [AstrMessageEvent, str, str], Awaitable[list[Any] | None]
+        ] | None = None,
+    ) -> list[Any] | str | None:
+        """监听进群申请 / 退群。
+
+        ``farewell`` 返回消息链表示立即发送；返回空列表表示已安排延迟发送；
+        返回 ``None`` 表示该群未开启退群告别，继续走旧的简单通知。
+        """
         raw = getattr(event.message_obj, "raw_message", None)
         if not isinstance(raw, dict):
             return None
@@ -608,23 +619,61 @@ class JoinFeature(Feature):
             and notice_type == "group_decrease"
             and raw.get("sub_type") == "leave"
         ):
-            if not parse_bool(self.store.value(group_id, "leave_notify"), False):
-                return None
-            nickname = await get_nickname(event, user_id)
-            message = f"{nickname}({user_id}) 主动退群了"
-            if parse_bool(self.store.value(group_id, "leave_block"), False):
-                await self._add_block(group_id, user_id)
-                message += "，已加入进群黑名单"
+            return await self._handle_leave(event, group_id, user_id, farewell)
+
+        return None
+
+    async def _handle_leave(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+        farewell: Callable[
+            [AstrMessageEvent, str, str], Awaitable[list[Any] | None]
+        ] | None,
+    ) -> list[Any] | str | None:
+        """处理主动退群：告别 / 简单通知 / 拉黑三者互不依赖。"""
+        farewell_result = (
+            await farewell(event, group_id, user_id) if farewell is not None else None
+        )
+        should_block = parse_bool(self.store.value(group_id, "leave_block"), False)
+        if should_block:
+            await self._add_block(group_id, user_id)
+
+        used_farewell = isinstance(farewell_result, list)
+        used_notify = not used_farewell and parse_bool(
+            self.store.value(group_id, "leave_notify"), False
+        )
+        if used_farewell or used_notify or should_block:
+            actions: list[str] = []
+            if used_farewell:
+                actions.append(
+                    "已安排延迟退群告别"
+                    if not farewell_result
+                    else "已发送退群告别"
+                )
+            if used_notify:
+                actions.append("已发送退群通知")
+            if should_block:
+                actions.append("已加入进群黑名单")
             await self.audit.record(
                 group_id=group_id,
                 action="leave",
                 target_id=user_id,
-                detail=message,
+                detail="主动退群；" + "；".join(actions),
                 source="event",
             )
-            return message
 
-        return None
+        if used_farewell:
+            return farewell_result or None
+        if not used_notify:
+            return None
+
+        nickname = await get_nickname(event, user_id)
+        message = f"{nickname}({user_id}) 主动退群了"
+        if should_block:
+            message += "，已加入进群黑名单"
+        return message
 
     async def _handle_join_request(
         self,

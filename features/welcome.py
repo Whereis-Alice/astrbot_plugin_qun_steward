@@ -39,6 +39,7 @@ from .base import Feature, resolve_targets, rest_of
 # {at} 不是字符串占位符，而要生成真正的 At 组件。先替换成不会出现在
 # 正常欢迎语里的哨兵，等其它占位符渲染完成后再切回消息组件。
 _AT_TOKEN = "\x00WELCOME_AT\x00"
+_DEFAULT_LEAVE_TEMPLATE = "{nickname}({user_id}) 离开了 {group_name}，江湖再见。"
 _CLEAR_WORDS = frozenset({"关", "关闭", "取消", "清空", "清除"})
 _VERIFY_ACTIONS = ("踢出", "踢出并拉黑", "仅提醒")
 _LOCAL_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|[\\/])")
@@ -69,6 +70,7 @@ class WelcomeFeature(Feature):
         super().__init__(ctx)
         self._pending: dict[tuple[str, str], _PendingVerification] = {}
         self._sequence: dict[str, int] = {}
+        self._leave_sequence: dict[str, int] = {}
         self._tasks: set[asyncio.Task[Any]] = set()
 
     # ------------------------------------------------------------ 生命周期 --- #
@@ -224,9 +226,25 @@ class WelcomeFeature(Feature):
         chain.extend(self._image_components(group_id))
         return chain
 
+    def _text_list(self, group_id: str, field: str) -> list[str]:
+        """读取文本模板列表，并兼容旧数据里未拆开的 ``||``。
+
+        早期 WebUI 曾把 ``A||B`` 保存成一个字符串。这里在读取端统一拆分，
+        旧配置不需要管理员手工修复，也不会把分隔符原样发进群里。
+        """
+        raw = self.store.value(group_id, field) or []
+        if isinstance(raw, str):
+            values: list[Any] = raw.split("||")
+        elif isinstance(raw, (list, tuple)):
+            values = []
+            for item in raw:
+                values.extend(str(item).split("||"))
+        else:
+            values = []
+        return [part.strip() for part in values if part.strip()]
+
     def _select_template(self, group_id: str) -> str:
-        templates = [str(item) for item in self.store.value(group_id, "welcome_templates") or []]
-        templates = [item for item in templates if item.strip()]
+        templates = self._text_list(group_id, "welcome_templates")
         if templates:
             mode = str(self.store.value(group_id, "welcome_mode") or "随机")
             if mode == "顺序":
@@ -240,11 +258,7 @@ class WelcomeFeature(Feature):
         return parse_bool(self.store.value(group_id, "welcome_enabled"), True)
 
     def _has_template(self, group_id: str) -> bool:
-        templates = [
-            str(item)
-            for item in self.store.value(group_id, "welcome_templates") or []
-            if str(item).strip()
-        ]
+        templates = self._text_list(group_id, "welcome_templates")
         return bool(templates or str(self.store.value(group_id, "join_welcome") or ""))
 
     async def _placeholder_values(
@@ -338,8 +352,104 @@ class WelcomeFeature(Feature):
                 logger.debug(f"{LOG_TAG} 获取群人数失败 group={group_id}：{exc}")
         return 0
 
-    def _image_components(self, group_id: str) -> list[Any]:
-        images = [str(item).strip() for item in self.store.value(group_id, "welcome_images") or []]
+    # ------------------------------------------------------------ 退群告别 --- #
+
+    async def leave_event(
+        self, event: AstrMessageEvent, group_id: str, user_id: str
+    ) -> list[Any] | None:
+        """处理主动退群告别；返回 ``[]`` 表示已经安排延迟发送。"""
+        if not self.leave_enabled(group_id):
+            return None
+        chain = await self.build_leave_farewell(event, group_id, user_id)
+        if not chain:
+            return None
+        delay = self._leave_delay(group_id)
+        if delay > 0:
+            self._spawn(self._send_leave_later(event, group_id, chain, delay))
+            return []
+        return chain
+
+    async def _send_leave_later(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        chain: list[Any],
+        delay: int,
+    ) -> None:
+        """延迟发送退群告别；等待期间关闭开关则不再补发。"""
+        try:
+            await asyncio.sleep(delay)
+            if not self.leave_enabled(group_id):
+                return
+            await event.send(event.chain_result(chain))
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"{LOG_TAG} 延迟退群告别发送失败 group={group_id}：{exc}")
+
+    async def build_leave_farewell(
+        self, event: AstrMessageEvent, group_id: str, user_id: str
+    ) -> list[Any]:
+        """按当前配置构建主动退群告别消息链。"""
+        template = self._select_leave_template(group_id)
+        values = await self._leave_placeholder_values(event, group_id, user_id, template)
+        try:
+            rendered = template.format_map(_SafeValues(values))
+        except (AttributeError, IndexError, KeyError, ValueError):
+            rendered = template
+
+        chain: list[Any] = [Comp.Plain(rendered)]
+        chain.extend(self._image_components(group_id, "leave_farewell_images"))
+        return chain
+
+    def _select_leave_template(self, group_id: str) -> str:
+        templates = self._text_list(group_id, "leave_farewell_templates")
+        if not templates:
+            return _DEFAULT_LEAVE_TEMPLATE
+        mode = str(self.store.value(group_id, "leave_farewell_mode") or "随机")
+        if mode == "顺序":
+            index = self._leave_sequence.get(group_id, 0) % len(templates)
+            self._leave_sequence[group_id] = index + 1
+            return templates[index]
+        return random.choice(templates)
+
+    async def _leave_placeholder_values(
+        self,
+        event: AstrMessageEvent,
+        group_id: str,
+        user_id: str,
+        template: str,
+    ) -> dict[str, str]:
+        values = {"user_id": user_id, "group_id": group_id}
+        if any(key in template for key in ("{nickname}", "{昵称}")):
+            values["nickname"] = await get_nickname(event, user_id)
+            values["昵称"] = values["nickname"]
+        if any(key in template for key in ("{group_name}", "{群名}")):
+            values["group_name"] = await self._group_name(event, group_id)
+            values["群名"] = values["group_name"]
+        if any(key in template for key in ("{member_count}", "{人数}")):
+            count = await self._member_count(event, group_id)
+            values["member_count"] = str(count)
+            values["人数"] = values["member_count"]
+        if any(key in template for key in ("{leave_time}", "{时间}")):
+            values["leave_time"] = self._now_text()
+            values["时间"] = values["leave_time"]
+        return values
+
+    def leave_enabled(self, group_id: str) -> bool:
+        return parse_bool(self.store.value(group_id, "leave_farewell_enabled"), False)
+
+    def _leave_delay(self, group_id: str) -> int:
+        return max(
+            0,
+            min(
+                parse_int(self.store.value(group_id, "leave_farewell_delay"), 0) or 0,
+                300,
+            ),
+        )
+
+    def _image_components(self, group_id: str, field: str = "welcome_images") -> list[Any]:
+        images = self._text_list(group_id, field)
         components: list[Any] = []
         for image in images:
             if not image:
@@ -354,7 +464,8 @@ class WelcomeFeature(Feature):
                 else:
                     components.append(Comp.Image.fromURL(image))
             except Exception as exc:  # noqa: BLE001
-                logger.warning(f"{LOG_TAG} 欢迎图片无效 {image}：{exc}")
+                label = "退群告别图片" if field.startswith("leave_") else "欢迎图片"
+                logger.warning(f"{LOG_TAG} {label}无效 {image}：{exc}")
         return components
 
     # ------------------------------------------------------------ 禁言工具 --- #
@@ -536,11 +647,35 @@ class WelcomeFeature(Feature):
 
     async def set_templates(self, event: AstrMessageEvent) -> str:
         return await self._edit_string_list(
-            event, "welcome_templates", "欢迎模板", enable_on_content=True
+            event,
+            "welcome_templates",
+            "欢迎模板",
+            enable_on_content=True,
+            enabled_field="welcome_enabled",
         )
 
     async def set_images(self, event: AstrMessageEvent) -> str:
-        return await self._edit_string_list(event, "welcome_images", "欢迎图片")
+        return await self._edit_string_list(
+            event, "welcome_images", "欢迎图片", enabled_field="welcome_enabled"
+        )
+
+    async def set_leave_templates(self, event: AstrMessageEvent) -> str:
+        return await self._edit_string_list(
+            event,
+            "leave_farewell_templates",
+            "退群告别模板",
+            enable_on_content=True,
+            enabled_field="leave_farewell_enabled",
+        )
+
+    async def set_leave_images(self, event: AstrMessageEvent) -> str:
+        return await self._edit_string_list(
+            event,
+            "leave_farewell_images",
+            "退群告别图片",
+            enable_on_content=True,
+            enabled_field="leave_farewell_enabled",
+        )
 
     async def _edit_string_list(
         self,
@@ -549,10 +684,12 @@ class WelcomeFeature(Feature):
         label: str,
         *,
         enable_on_content: bool = False,
+        enabled_field: str = "welcome_enabled",
     ) -> str:
         group_id = event.get_group_id()
         raw = rest_of(event)
-        current = [str(item) for item in self.store.value(group_id, field) or []]
+        # 读取时顺手归一化旧数据：早期版本可能已经把 “A||B” 存成一个条目。
+        current = self._text_list(group_id, field)
         if not raw:
             items = current or []
             body = "\n".join(f"{index}. {item}" for index, item in enumerate(items, 1))
@@ -584,8 +721,8 @@ class WelcomeFeature(Feature):
 
         changes: dict[str, Any] = {field: current}
         if enable_on_content and current:
-            # 全局默认关闭时，管理员在某个群写模板通常就是想启用该群欢迎。
-            changes["welcome_enabled"] = True
+            # 全局默认关闭时，管理员在某个群写模板通常就是想启用该群对应功能。
+            changes[enabled_field] = True
         await self.store.update(group_id, changes)
         await self.log(event, field, detail=f"{len(current)} 项")
         if added:
@@ -634,6 +771,42 @@ class WelcomeFeature(Feature):
         await self.store.set(group_id, "welcome_delay", value)
         await self.log(event, "welcome_delay", detail=str(value))
         return f"本群欢迎延迟已设为：{value} 秒"
+
+    async def toggle_leave_farewell(self, event: AstrMessageEvent) -> str:
+        """按群开关退群告别；模板和图片配置保留。"""
+        group_id = event.get_group_id()
+        raw = rest_of(event)
+        mode = parse_bool(raw)
+        if mode is None:
+            return f"本群退群告别：{switch_text(self.leave_enabled(group_id))}"
+
+        await self.store.set(group_id, "leave_farewell_enabled", mode)
+        await self.log(event, "leave_farewell_enabled", detail=switch_text(mode))
+        if not mode:
+            return "已关闭本群退群告别。模板和图片配置保留。"
+        return "已开启本群退群告别。未配置模板时会使用内置告别文案。"
+
+    async def set_leave_mode(self, event: AstrMessageEvent) -> str:
+        group_id = event.get_group_id()
+        raw = rest_of(event)
+        if not raw:
+            return f"本群退群告别模式：{self.store.value(group_id, 'leave_farewell_mode')}"
+        if raw not in {"随机", "顺序"}:
+            return "退群告别模式只支持「随机」或「顺序」。"
+        await self.store.set(group_id, "leave_farewell_mode", raw)
+        await self.log(event, "leave_farewell_mode", detail=raw)
+        return f"本群退群告别模式已设为：{raw}"
+
+    async def set_leave_delay(self, event: AstrMessageEvent) -> str:
+        group_id = event.get_group_id()
+        raw = rest_of(event)
+        value = parse_int(raw)
+        if value is None:
+            return f"本群退群告别延迟：{self._leave_delay(group_id)} 秒"
+        value = max(0, min(value, 300))
+        await self.store.set(group_id, "leave_farewell_delay", value)
+        await self.log(event, "leave_farewell_delay", detail=str(value))
+        return f"本群退群告别延迟已设为：{value} 秒"
 
     async def toggle_verify(self, event: AstrMessageEvent) -> str:
         group_id = event.get_group_id()
@@ -706,12 +879,28 @@ class WelcomeFeature(Feature):
             chain.insert(0, Comp.Plain(f"（测试预览，实际会延迟 {delay} 秒）\n"))
         return chain
 
+    async def leave_test(self, event: AstrMessageEvent) -> list[Any] | str:
+        """按当前配置预览退群告别，不发送真实退群事件。"""
+        group_id = event.get_group_id()
+        if not group_id:
+            return "退群告别测试只能在群里使用。"
+        if not self.leave_enabled(group_id):
+            return "本群退群告别已关闭。开启请用「退群告别 开」。"
+
+        targets = resolve_targets(event)
+        user_id = targets[0] if targets else str(event.get_sender_id())
+        chain = await self.build_leave_farewell(event, group_id, user_id)
+        delay = self._leave_delay(group_id)
+        if delay > 0:
+            chain.insert(0, Comp.Plain(f"（测试预览，实际会延迟 {delay} 秒）\n"))
+        return chain
+
     async def config_text(self, event: AstrMessageEvent) -> str:
         group_id = event.get_group_id()
         if not group_id:
             return "欢迎配置只能在群里查看。"
-        templates = [str(item) for item in self.store.value(group_id, "welcome_templates") or []]
-        images = [str(item) for item in self.store.value(group_id, "welcome_images") or []]
+        templates = self._text_list(group_id, "welcome_templates")
+        images = self._text_list(group_id, "welcome_images")
         legacy = str(self.store.value(group_id, "join_welcome") or "")
         lines = [
             f"【欢迎配置】群 {group_id}",
@@ -732,6 +921,25 @@ class WelcomeFeature(Feature):
         ]
         if parse_bool(self.store.value(group_id, "welcome_verify"), False):
             lines.append("提示：开启验证时会跳过「进群禁言」，否则新人无法回复答案。")
+        return "\n".join(lines)
+
+    async def leave_config_text(self, event: AstrMessageEvent) -> str:
+        group_id = event.get_group_id()
+        if not group_id:
+            return "退群告别配置只能在群里查看。"
+        templates = self._text_list(group_id, "leave_farewell_templates")
+        images = self._text_list(group_id, "leave_farewell_images")
+        lines = [
+            f"【退群告别配置】群 {group_id}",
+            (
+                f"退群告别：{switch_text(self.leave_enabled(group_id))}；"
+                f"模板模式：{self.store.value(group_id, 'leave_farewell_mode')}；"
+                f"延迟：{self._leave_delay(group_id)} 秒"
+            ),
+            "告别模板：" + (list_text(templates, "（空，使用内置文案）")),
+            "告别图片：" + list_text(images),
+            "旧「主动退群通知」在退群告别开启时不会同时发送；「主动退群拉黑」独立生效。",
+        ]
         return "\n".join(lines)
 
 

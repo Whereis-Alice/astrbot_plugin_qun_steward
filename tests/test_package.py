@@ -50,6 +50,21 @@ class TestMetadata:
     def test_directory_name_matches(self, plugin_dir: Path) -> None:
         assert plugin_dir.name == PLUGIN_NAME
 
+    def test_leave_farewell_is_documented_for_release(
+        self, metadata: dict[str, Any], plugin_dir: Path
+    ) -> None:
+        readme = (plugin_dir / "README.md").read_text(encoding="utf-8")
+        help_text = (plugin_dir / "features/config_cmd.py").read_text(encoding="utf-8")
+
+        assert metadata["version"] == "v1.6.0"
+        assert "退群告别" in metadata["desc"]
+        assert "退群告别模板" in metadata["help"]
+        assert "## 退群告别" in readme
+        assert "默认关闭" in readme
+        assert "sub_type=leave" in readme
+        assert "退群拉黑` 完全独立" in readme
+        assert "退群告别模板 [模板||模板]" in help_text
+
 
 class TestRequirements:
     """依赖清单的硬约束。
@@ -230,6 +245,12 @@ class TestWebUi:
         html = (plugin_dir / "pages/dashboard/index.html").read_text(encoding="utf-8")
         assert "app.js" in html
         assert "style.css" in html
+
+    def test_web_ui_supports_text_list_pipe_separator(self, plugin_dir: Path) -> None:
+        """WebUI 每行一项；带空格的模板还需要识别 ||，不能把分隔符原样发进群里。"""
+        app_js = (plugin_dir / "pages/dashboard/app.js").read_text(encoding="utf-8")
+        assert 'String(meta.list_style || "") === "text"' in app_js
+        assert "onePerLineOrPipe" in app_js
 
     def test_index_html_declares_ids_used_by_app_js(self, plugin_dir: Path) -> None:
         """app.js 通过 getElementById 拿外壳节点，缺一个就是整页白屏。"""

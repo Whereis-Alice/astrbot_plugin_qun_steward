@@ -45,6 +45,7 @@
     "off": "Off",
     "on": "On",
     "onePerLine": "One item per line",
+    "onePerLineOrPipe": "One item per line, or separate with ||",
     "query": "Search",
     "ready": "Connected",
     "refresh": "Refresh",
