@@ -25,6 +25,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..core.config import LOG_TAG
+from ..core.group_count import member_count
 from ..core.protocol import unwrap
 from ..core.utils import (
     get_nickname,
@@ -177,24 +178,26 @@ class WelcomeFeature(Feature):
         """构建欢迎消息；配置了延迟时转入后台发送。"""
         if not self._enabled(group_id):
             return None
-        chain = await self.build_welcome(event, group_id, user_id)
-        if not chain:
-            return None
         delay = self._delay(group_id)
         if delay <= 0:
-            return chain
-        self._spawn(self._send_later(event, chain, delay))
+            return await self.build_welcome(event, group_id, user_id) or None
+        if not self._has_template(group_id):
+            return None
+        self._spawn(self._send_later(event, group_id, user_id, delay))
         return None
 
     async def _send_later(
-        self, event: AstrMessageEvent, chain: list[Any], delay: int
+        self, event: AstrMessageEvent, group_id: str, user_id: str, delay: int
     ) -> None:
         try:
             await asyncio.sleep(delay)
             # 延迟期间管理员关闭欢迎时，不再补发这条旧欢迎。
-            if not self._enabled(event.get_group_id()):
+            if not self._enabled(group_id):
                 return
-            await event.send(event.chain_result(chain))
+            # 等待后再渲染，避免人数在新人入群的一瞬间就被旧缓存固定下来。
+            chain = await self.build_welcome(event, group_id, user_id)
+            if chain and self._enabled(group_id):
+                await event.send(event.chain_result(chain))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
@@ -279,8 +282,8 @@ class WelcomeFeature(Feature):
             values["group_name"] = await self._group_name(event, group_id)
             values["群名"] = values["group_name"]
         if any(key in template for key in ("{member_count}", "{人数}")):
-            count = await self._member_count(event, group_id)
-            values["member_count"] = str(count)
+            count = await member_count(event, group_id)
+            values["member_count"] = str(count) if count is not None else "未知"
             values["人数"] = values["member_count"]
         if any(key in template for key in ("{join_time}", "{时间}")):
             values["join_time"] = self._now_text()
@@ -330,27 +333,6 @@ class WelcomeFeature(Feature):
             except Exception as exc:  # noqa: BLE001
                 logger.debug(f"{LOG_TAG} 获取群名失败 group={group_id}：{exc}")
         return group_id
-
-    async def _member_count(self, event: AstrMessageEvent, group_id: str) -> int:
-        raw = getattr(getattr(event, "message_obj", None), "raw_message", None)
-        if isinstance(raw, dict):
-            for key in ("member_count", "memberCount", "current_member_count", "currentMemberCount"):
-                value = parse_int(raw.get(key))
-                if value is not None and value > 0:
-                    return value
-
-        getter = getattr(event.bot, "get_group_info", None)
-        if callable(getter):
-            try:
-                info = unwrap(await getter(group_id=int(group_id), no_cache=False))
-                if isinstance(info, dict):
-                    for key in ("member_count", "memberCount", "current_member_count"):
-                        value = parse_int(info.get(key))
-                        if value is not None and value > 0:
-                            return value
-            except Exception as exc:  # noqa: BLE001
-                logger.debug(f"{LOG_TAG} 获取群人数失败 group={group_id}：{exc}")
-        return 0
 
     # ------------------------------------------------------------ 退群告别 --- #
 
@@ -428,8 +410,8 @@ class WelcomeFeature(Feature):
             values["group_name"] = await self._group_name(event, group_id)
             values["群名"] = values["group_name"]
         if any(key in template for key in ("{member_count}", "{人数}")):
-            count = await self._member_count(event, group_id)
-            values["member_count"] = str(count)
+            count = await member_count(event, group_id)
+            values["member_count"] = str(count) if count is not None else "未知"
             values["人数"] = values["member_count"]
         if any(key in template for key in ("{leave_time}", "{时间}")):
             values["leave_time"] = self._now_text()

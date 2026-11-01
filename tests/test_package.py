@@ -43,6 +43,12 @@ class TestMetadata:
     def test_version_format(self, metadata: dict[str, Any]) -> None:
         assert re.fullmatch(r"v\d+\.\d+\.\d+", str(metadata["version"]))
 
+    def test_current_version_has_changelog(
+        self, metadata: dict[str, Any], plugin_dir: Path
+    ) -> None:
+        changelog = (plugin_dir / "CHANGELOG.md").read_text(encoding="utf-8")
+        assert f"## [{metadata['version']}]" in changelog
+
     def test_platform_and_tags(self, metadata: dict[str, Any]) -> None:
         assert metadata["support_platforms"] == ["aiocqhttp"]
         assert isinstance(metadata["tags"], list) and metadata["tags"]
@@ -56,7 +62,6 @@ class TestMetadata:
         readme = (plugin_dir / "README.md").read_text(encoding="utf-8")
         help_text = (plugin_dir / "features/config_cmd.py").read_text(encoding="utf-8")
 
-        assert metadata["version"] == "v1.6.0"
         assert "退群告别" in metadata["desc"]
         assert "退群告别模板" in metadata["help"]
         assert "## 退群告别" in readme

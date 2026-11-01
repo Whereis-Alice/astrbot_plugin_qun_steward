@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from astrbot.api import message_components as Comp
@@ -57,6 +58,9 @@ class _Bot:
 
     async def get_group_info(self, **kwargs: Any) -> dict[str, Any]:
         return {**kwargs, "group_name": "接口群名", "member_count": 88}
+
+    async def get_group_member_list(self, **kwargs: Any) -> list[dict[str, int]]:
+        return [{"user_id": int(UID)}, *({"user_id": 30000 + i} for i in range(65))]
 
     async def set_group_ban(self, **kwargs: Any) -> None:
         self.ban_calls.append(kwargs)
@@ -158,6 +162,31 @@ def _leave_event(**raw: Any) -> _Event:
 
 
 class TestBuildWelcome:
+    async def test_member_count_matches_qq_after_join(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "join_welcome", "欢迎{nickname}，{group_name}{member_count}人了呢（{人数}）")
+        event = _increase_event(member_count=348, group_name="星之卡比万事屋")
+        event.bot.get_group_member_list = AsyncMock(return_value=[
+            {"user_id": int(UID)}, *({"user_id": 30000 + i} for i in range(348)),
+        ])
+
+        chain = await welcome.build_welcome(event, GID, UID)
+
+        assert chain[0].text == "欢迎阿狸，星之卡比万事屋349人了呢（349）"
+
+    async def test_member_count_failure_preserves_welcome_with_unknown_label(
+        self, welcome: WelcomeFeature, store: GroupStore
+    ) -> None:
+        await store.set(GID, "join_welcome", "欢迎 {nickname}，群人数：{member_count}")
+        event = _increase_event(member_count=None)
+        event.bot.get_group_member_list = AsyncMock(side_effect=RuntimeError("离线"))
+        event.bot.get_group_info = AsyncMock(side_effect=RuntimeError("离线"))
+
+        chain = await welcome.build_welcome(event, GID, UID)
+
+        assert chain[0].text == "欢迎 阿狸，群人数：未知"
+
     async def test_legacy_text_still_works_with_placeholders(
         self, welcome: WelcomeFeature, store: GroupStore
     ) -> None:
@@ -529,6 +558,30 @@ class TestVerification:
 
 
 class TestWelcomeTasks:
+    async def test_delayed_welcome_reads_count_after_waiting(
+        self, welcome: WelcomeFeature, store: GroupStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await store.update(GID, {"join_welcome": "现在 {member_count} 人", "welcome_delay": 3})
+        event = _increase_event(member_count=348)
+        refreshed = False
+
+        async def getter(**kwargs: Any) -> list[dict[str, int]]:
+            assert refreshed, "人数必须在延迟结束后再查询"
+            return [{"user_id": int(UID)}, *({"user_id": 30000 + i} for i in range(348))]
+
+        async def finish_delay(seconds: float) -> None:
+            nonlocal refreshed
+            assert seconds == 3
+            refreshed = True
+
+        event.bot.get_group_member_list = getter
+        monkeypatch.setattr(welcome_mod.asyncio, "sleep", finish_delay)
+
+        assert await welcome.handle_notice(event) is None
+        await asyncio.gather(*list(welcome._tasks))
+
+        assert event.sent[0][1][0].text == "现在 349 人"
+
     async def test_delayed_welcome_is_sent_by_background_task(
         self,
         welcome: WelcomeFeature,
