@@ -30,7 +30,7 @@ from .core.permission import PermissionResolver, PermLevel, perm_required
 from .core.protocol import clear_backend_cache
 from .core.store import GroupStore
 from .core.undo import UndoStack
-from .core.utils import parse_bool
+from .core.utils import parse_bool, parse_int
 from .features.album import AlbumFeature, PickedImage
 from .features.base import FeatureContext, args_of, rest_of
 from .features.config_cmd import ConfigFeature
@@ -275,6 +275,12 @@ class QunStewardPlugin(Star):
     async def cmd_ban(self, event: AstrMessageEvent):
         """禁言 <秒数> @某人：秒数留空按随机区间取值"""
         yield event.plain_result(await self.moderation.ban(event, ban_time=_optional(event)))
+
+    @filter.command("禁我", alias={"自我禁言"})
+    @perm_required(PermLevel.ADMIN, perm_key="self_ban", check_at=False)
+    async def cmd_ban_self(self, event: AstrMessageEvent):
+        """禁我 [秒数]：只禁言当前发言者自己，不写秒数时按随机区间取值"""
+        yield event.plain_result(await self.moderation.ban_self(event, _optional(event)))
 
     @filter.command("解禁")
     @perm_required(PermLevel.ADMIN, perm_key="cancel_group_ban")
@@ -943,8 +949,8 @@ class QunStewardPlugin(Star):
 
     # ================================================================ LLM 工具
     #
-    # 全部受 enable_llm_tools 总开关控制；need_auth=True 时按发起者权限鉴权，
-    # 踢人 / 拉黑这类不可逆操作强制鉴权，避免被提示词绕过。
+    # 全部受 enable_llm_tools 总开关控制，且始终按发起者权限鉴权。
+    # need_auth 参数仅为兼容旧调用保留，模型不能关闭权限检查。
 
     @filter.llm_tool()
     async def llm_set_group_ban(
@@ -959,16 +965,45 @@ class QunStewardPlugin(Star):
         Args:
             user_id(number): 要禁言的用户QQ号
             duration(number): 禁言秒数，0 表示解除禁言
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
+        """
+        if not self.cfg.enable_llm_tools:
+            return
+        # 工具参数里的 need_auth 不能成为权限绕过开关。模型代表当前发言者
+        # 调用时一律鉴权；只有目标正是发言者本人，才使用成员级「禁我」权限。
+        self_ban = str(user_id) == str(event.get_sender_id()) and duration != 0
+        perm_key = "self_ban" if self_ban else (
+            "cancel_group_ban" if parse_int(duration) == 0 else "set_group_ban"
+        )
+        if reason := await self.permissions.check_llm(
+            event, perm_key, bot_perm=PermLevel.ADMIN, need_auth=True, target_id=user_id
+        ):
+            yield reason
+            return
+        if self_ban:
+            result = await self.moderation.ban_self(event, duration)
+        else:
+            result = await self.moderation.ban(event, ban_time=duration, target_id=user_id)
+        if result:
+            yield result
+
+    @filter.llm_tool()
+    async def llm_ban_self(self, event: AstrMessageEvent, duration: int = 60):
+        """
+        仅当用户明确请求禁言自己时调用。目标固定为当前发言者，默认禁言 60 秒。
+        机器人必须具有群管理权限；机器人是管理员时不能禁言其他管理员。
+        Args:
+            duration(number): 禁言秒数，必须大于0，不能用来解除禁言
         """
         if not self.cfg.enable_llm_tools:
             return
         if reason := await self.permissions.check_llm(
-            event, "set_group_ban", bot_perm=PermLevel.ADMIN, need_auth=need_auth
+            event, "self_ban", bot_perm=PermLevel.ADMIN, need_auth=True,
+            target_id=event.get_sender_id(),
         ):
             yield reason
             return
-        if result := await self.moderation.ban(event, ban_time=duration, target_id=user_id):
+        if result := await self.moderation.ban_self(event, duration):
             yield result
 
     @filter.llm_tool()
@@ -984,12 +1019,16 @@ class QunStewardPlugin(Star):
         Args:
             user_id(number): 要改名的用户QQ号
             card(string): 新的群名片，留空表示恢复原昵称
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
         if reason := await self.permissions.check_llm(
-            event, "set_group_card", bot_perm=PermLevel.ADMIN, need_auth=need_auth
+            event,
+            "set_group_card",
+            bot_perm=PermLevel.ADMIN,
+            need_auth=True,
+            target_id=user_id,
         ):
             yield reason
             return
@@ -1009,12 +1048,16 @@ class QunStewardPlugin(Star):
         Args:
             user_id(number): 要设置头衔的用户QQ号
             special_title(string): 新头衔，留空表示清除头衔
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
         if reason := await self.permissions.check_llm(
-            event, "set_group_special_title", bot_perm=PermLevel.OWNER, need_auth=need_auth
+            event,
+            "set_group_special_title",
+            bot_perm=PermLevel.OWNER,
+            need_auth=True,
+            target_id=user_id,
         ):
             yield reason
             return
@@ -1034,7 +1077,7 @@ class QunStewardPlugin(Star):
         开启或关闭全员禁言。
         Args:
             enable(boolean): True 开启全员禁言，False 解除全员禁言
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1056,7 +1099,11 @@ class QunStewardPlugin(Star):
         if not self.cfg.enable_llm_tools:
             return
         if reason := await self.permissions.check_llm(
-            event, "set_group_kick", bot_perm=PermLevel.ADMIN, need_auth=True
+            event,
+            "set_group_kick",
+            bot_perm=PermLevel.ADMIN,
+            need_auth=True,
+            target_id=user_id,
         ):
             yield reason
             return
@@ -1073,7 +1120,11 @@ class QunStewardPlugin(Star):
         if not self.cfg.enable_llm_tools:
             return
         if reason := await self.permissions.check_llm(
-            event, "set_group_block", bot_perm=PermLevel.ADMIN, need_auth=True
+            event,
+            "set_group_block",
+            bot_perm=PermLevel.ADMIN,
+            need_auth=True,
+            target_id=user_id,
         ):
             yield reason
             return
@@ -1093,7 +1144,7 @@ class QunStewardPlugin(Star):
         Args:
             message_id(number): 目标消息的消息ID
             enable(boolean): True 设为精华，False 移出精华
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1110,7 +1161,7 @@ class QunStewardPlugin(Star):
         """
         获取当前群聊的精华消息列表。
         Args:
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1130,7 +1181,7 @@ class QunStewardPlugin(Star):
         修改当前群聊的群名称。
         Args:
             group_name(string): 新的群名称
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1150,7 +1201,7 @@ class QunStewardPlugin(Star):
         修改当前群聊的群头像。
         Args:
             image_url(string): 新头像的图片直链，留空则取用户消息里引用的图片
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1170,7 +1221,7 @@ class QunStewardPlugin(Star):
         在当前群聊发布一条群公告。
         Args:
             content(string): 群公告正文
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1187,7 +1238,7 @@ class QunStewardPlugin(Star):
         """
         获取当前群聊已发布的群公告。
         Args:
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1207,7 +1258,7 @@ class QunStewardPlugin(Star):
         把用户引用的文件上传到群文件的指定位置。
         Args:
             path(string): 目标路径，格式为「文件夹名/文件名」或「文件名」
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1227,7 +1278,7 @@ class QunStewardPlugin(Star):
         删除群文件里的某个文件。
         Args:
             path(string): 目标路径，格式为「文件夹名/文件名」或「文件名」
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return
@@ -1247,7 +1298,7 @@ class QunStewardPlugin(Star):
         浏览群文件目录或查看某个群文件的详情。
         Args:
             path(string): 目标路径，留空表示根目录
-            need_auth(boolean): 是否鉴权，机器人自行发起填 False，代当前用户发起填 True
+            need_auth(boolean): 兼容旧调用的参数，始终按当前发言者权限鉴权
         """
         if not self.cfg.enable_llm_tools:
             return

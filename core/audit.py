@@ -18,6 +18,7 @@ from .store import FIELD_LABELS
 #: 动作标识 -> 中文名，用于展示
 ACTION_LABELS: dict[str, str] = {
     "ban": "禁言",
+    "self_ban": "自我禁言",
     "unban": "解除禁言",
     "whole_ban": "全员禁言",
     "kick": "移出群聊",

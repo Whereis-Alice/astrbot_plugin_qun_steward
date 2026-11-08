@@ -142,6 +142,8 @@ class TestConfSchema:
         perms = schema["perms"]["items"]
         assert perms["vote_start"]["default"] == "管理员"
         assert perms["vote"]["default"] == "成员"
+        assert perms["self_ban"]["default"] == "成员"
+        assert "自我禁言" in perms["self_ban"]["description"]
         assert "发起" in perms["vote_start"]["description"]
         assert "参与" in perms["vote"]["description"]
 

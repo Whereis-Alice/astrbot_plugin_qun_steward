@@ -106,6 +106,33 @@ class TestRequiredLevel:
         resolver = PermissionResolver(make_config(), store)
         assert resolver.required_level(GID, "从未定义过的功能") is PermLevel.ADMIN
 
+    async def test_self_ban_defaults_to_member_for_old_configs(
+        self, store: GroupStore, make_config: ConfigFactory
+    ) -> None:
+        resolver = PermissionResolver(make_config(), store)
+        assert resolver.required_level(GID, "self_ban") is PermLevel.MEMBER
+
+    async def test_self_ban_group_override_is_respected(
+        self, store: GroupStore, make_config: ConfigFactory
+    ) -> None:
+        resolver = PermissionResolver(make_config(), store)
+        await store.set(GID, "perms", {"self_ban": "管理员"})
+        assert resolver.required_level(GID, "self_ban") is PermLevel.ADMIN
+
+    @pytest.mark.parametrize("configured", ["管理员", "乱写的", ""])
+    async def test_self_ban_explicit_global_setting_is_respected(
+        self, store: GroupStore, make_config: ConfigFactory, configured: str
+    ) -> None:
+        resolver = PermissionResolver(make_config(perms={"self_ban": configured}), store)
+        assert resolver.required_level(GID, "self_ban") is PermLevel.ADMIN
+
+    async def test_self_ban_group_override_wins_over_global(
+        self, store: GroupStore, make_config: ConfigFactory
+    ) -> None:
+        resolver = PermissionResolver(make_config(perms={"self_ban": "群主"}), store)
+        await store.set(GID, "perms", {"self_ban": "成员"})
+        assert resolver.required_level(GID, "self_ban") is PermLevel.MEMBER
+
 
 class TestSuperuserAndThreshold:
     async def test_is_superuser(self, store: GroupStore, make_config: ConfigFactory) -> None:

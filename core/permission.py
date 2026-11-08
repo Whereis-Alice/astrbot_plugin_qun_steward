@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 import inspect
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from enum import IntEnum
 from functools import wraps
 from typing import Any
@@ -16,8 +16,9 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from .config import LOG_TAG, StewardConfig
+from .protocol import as_dict, extract_failure
 from .store import GroupStore
-from .utils import get_ats, parse_int
+from .utils import get_ats, get_replyer_id, parse_int
 
 AIOCQHTTP_ADAPTER = "aiocqhttp"
 
@@ -96,18 +97,26 @@ class PermissionResolver:
         group_perms = self._store.value(group_id, "perms")
         if isinstance(group_perms, dict) and perm_key in group_perms:
             return PermLevel.from_label(group_perms[perm_key])
+        # 新增的自我禁言权限要兼容旧配置：没有显式字段时按成员开放，
+        # 否则 PermissionResolver 的未知项默认会收紧成管理员。
+        if perm_key == "self_ban" and perm_key not in self._config.perms:
+            return PermLevel.MEMBER
         return PermLevel.from_label(self._config.perms.get(perm_key))
 
     def is_superuser(self, user_id: Any) -> bool:
         return str(user_id) in self._config.admins_id
 
     async def level_of(self, event: AstrMessageEvent, user_id: Any) -> PermLevel:
-        """查询某人在当前群里的权限等级。"""
-        uid = str(user_id)
-        if self.is_superuser(uid):
+        """插件授权等级：超管身份仅用于调用者授权，不代表 QQ 群身份。"""
+        if self.is_superuser(user_id):
             return PermLevel.SUPERUSER
+        return await self.group_level_of(event, user_id)
+
+    async def group_level_of(self, event: AstrMessageEvent, user_id: Any) -> PermLevel:
+        """查询实际群身份；失败或缺少 role 时返回未知，不能猜成普通成员。"""
+        uid = str(user_id)
         group_id = event.get_group_id()
-        if not group_id:
+        if not group_id or not uid.isascii() or not uid.isdecimal() or int(uid) <= 0:
             return PermLevel.UNKNOWN
         try:
             info = await event.bot.get_group_member_info(
@@ -116,33 +125,46 @@ class PermissionResolver:
         except Exception as exc:  # noqa: BLE001 - 协议端不可用时降级为「未知」
             logger.debug(f"{LOG_TAG} 获取群成员信息失败 group={group_id} user={uid}: {exc}")
             return PermLevel.UNKNOWN
-        role = str((info or {}).get("role") or "")
+        if extract_failure(info):
+            return PermLevel.UNKNOWN
+        info = as_dict(info)
+        role = str(info.get("role") or "").lower()
         if role == "owner":
             return PermLevel.OWNER
         if role == "admin":
             return PermLevel.ADMIN
-        level = parse_int((info or {}).get("level"), 0) or 0
+        if role != "member":
+            return PermLevel.UNKNOWN
+        level = parse_int(info.get("level"), 0) or 0
         return PermLevel.HIGH if level >= self.level_threshold(group_id) else PermLevel.MEMBER
 
     async def self_level(self, event: AstrMessageEvent) -> PermLevel:
         """机器人自己在当前群里的权限等级（不受超管名单影响）。"""
-        group_id = event.get_group_id()
-        self_id = event.get_self_id()
-        if not group_id or not self_id:
-            return PermLevel.UNKNOWN
-        try:
-            info = await event.bot.get_group_member_info(
-                group_id=int(group_id), user_id=int(self_id), no_cache=True
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(f"{LOG_TAG} 获取机器人群身份失败 group={group_id}: {exc}")
-            return PermLevel.UNKNOWN
-        role = str((info or {}).get("role") or "")
-        if role == "owner":
-            return PermLevel.OWNER
-        if role == "admin":
-            return PermLevel.ADMIN
-        return PermLevel.MEMBER
+        return await self.group_level_of(event, event.get_self_id())
+
+    async def check_ban_target(
+        self, event: AstrMessageEvent, target_id: Any, *, bot_level: PermLevel | None = None
+    ) -> str | None:
+        """禁言/解禁的 QQ 硬性限制；自我禁言和超管也不能绕过。"""
+        uid = str(target_id)
+        if not uid.isascii() or not uid.isdecimal() or int(uid) <= 0:
+            return "目标 QQ 号必须是正整数。"
+        if bot_level is None:
+            bot_level = await self.self_level(event)
+        if bot_level is PermLevel.UNKNOWN:
+            return "无法确认机器人的群身份，请稍后重试。"
+        if bot_level < PermLevel.ADMIN:
+            return "机器人当前是普通群成员，没有管理员权限，无法禁言或解除禁言。"
+        if uid == str(event.get_self_id()):
+            return "机器人无法禁言或解除禁言自己。"
+        target_level = await self.group_level_of(event, uid)
+        if target_level is PermLevel.UNKNOWN:
+            return "无法确认目标用户的群身份，未执行禁言或解禁，请稍后重试。"
+        if target_level is PermLevel.OWNER:
+            return "目标是群主，无法禁言或解除禁言。"
+        if bot_level is PermLevel.ADMIN and target_level is PermLevel.ADMIN:
+            return "机器人和目标都是群管理员，无法禁言或解除禁言；只有群主可以操作管理员。"
+        return None
 
     # ---------------------------------------------------------------- 鉴权 --- #
     async def check(
@@ -152,32 +174,49 @@ class PermissionResolver:
         bot_perm: PermLevel = PermLevel.ADMIN,
         perm_key: str | None = None,
         check_at: bool = True,
+        target_ids: Iterable[Any] | None = None,
     ) -> str | None:
         """返回拒绝理由；None 表示放行。"""
         group_id = event.get_group_id()
         sender_id = str(event.get_sender_id())
         required = self.required_level(group_id, perm_key)
 
+        bot_level = await self.self_level(event)
+        if bot_level is PermLevel.UNKNOWN:
+            return "无法确认机器人的群身份，请稍后重试。"
+        if bot_level < bot_perm:
+            return f"机器人当前的群身份是{bot_level.label}，没有{bot_perm.label}权限，无法执行此操作。"
+
         user_level = await self.level_of(event, sender_id)
+        if user_level is PermLevel.UNKNOWN:
+            return "无法确认你的群身份，请稍后重试。"
         if user_level < required:
             return f"你没{required.label}权限"
-
-        bot_level = await self.self_level(event)
-        if bot_level < bot_perm:
-            return f"我没{bot_perm.label}权限"
 
         if not check_at:
             return None
 
         # 目标校验：机器人和调用者都必须严格高于目标，避免借机器人越权互殴。
-        for target_id in get_ats(event):
+        targets = get_ats(event) if target_ids is None else [str(item) for item in target_ids]
+        ban_action = perm_key in {"set_group_ban", "cancel_group_ban", "self_ban"}
+        if ban_action and target_ids is None and not targets and (replyer := get_replyer_id(event)):
+            targets = [replyer]
+        for target_id in targets:
+            if ban_action and (
+                reason := await self.check_ban_target(event, target_id, bot_level=bot_level)
+            ):
+                return reason
             if target_id == sender_id:
-                continue  # 自助操作（例如自我禁言）放行
+                continue  # 自助操作免调用者层级比较，但不能跳过 QQ 硬性限制
             target_level = await self.level_of(event, target_id)
             if target_level is PermLevel.UNKNOWN:
-                continue
-            if bot_level <= target_level:
-                return f"我动不了{target_level.label}"
+                return "无法确认目标用户的群身份，请稍后重试。"
+            if not ban_action:
+                physical_level = await self.group_level_of(event, target_id)
+                if physical_level is PermLevel.UNKNOWN:
+                    return "无法确认目标用户的群身份，请稍后重试。"
+                if bot_level <= physical_level:
+                    return f"我动不了{target_level.label}"
             if user_level is not PermLevel.SUPERUSER and user_level <= target_level:
                 return f"你动不了{target_level.label}"
         return None
@@ -189,19 +228,20 @@ class PermissionResolver:
         *,
         bot_perm: PermLevel = PermLevel.ADMIN,
         need_auth: bool = True,
+        target_id: Any | None = None,
     ) -> str | None:
-        """LLM 函数工具的鉴权：先校验平台，再按需校验调用者权限。"""
+        """LLM 工具始终按当前发言者鉴权；need_auth 仅为兼容旧调用保留。"""
         if event.get_platform_name() != AIOCQHTTP_ADAPTER:
             return "该工具仅支持通过 QQ 群聊调用"
         if not event.get_group_id():
             return "该工具仅支持在 QQ 群聊中调用"
-        if not need_auth:
-            # 机器人自行发起：只需确认机器人自身有权限
-            bot_level = await self.self_level(event)
-            if bot_level < bot_perm:
-                return f"我没{bot_perm.label}权限"
-            return None
-        return await self.check(event, bot_perm=bot_perm, perm_key=perm_key, check_at=False)
+        return await self.check(
+            event,
+            bot_perm=bot_perm,
+            perm_key=perm_key,
+            check_at=target_id is not None,
+            target_ids=None if target_id is None else [target_id],
+        )
 
 
 _SKIP = "\x00skip"

@@ -15,6 +15,7 @@ from ..core.protocol import (
     call_action,
     detect_backend,
     explain_action_error,
+    extract_failure,
     is_unsupported_error,
 )
 from ..core.utils import extract_image_url, format_duration, get_nickname, parse_bool, parse_int
@@ -50,41 +51,85 @@ class ModerationFeature(Feature):
         return resolve_targets(event)
 
     # ---------------------------------------------------------------- 禁言 --- #
+    async def _set_ban(self, event: AstrMessageEvent, target_id: Any, seconds: int) -> None:
+        """在实际执行前核实 QQ 身份，并兼容未抛异常的失败响应。"""
+        if reason := await self.permissions.check_ban_target(event, target_id):
+            raise ValueError(reason)
+        response = await event.bot.set_group_ban(
+            group_id=int(event.get_group_id()), user_id=int(target_id), duration=seconds
+        )
+        if failure := extract_failure(response):
+            raise RuntimeError(failure)
+
     async def ban(
         self,
         event: AstrMessageEvent,
         ban_time: Any = None,
         target_id: Any = "",
+        *,
+        action: str = "ban",
+        self_target: bool = False,
     ) -> str:
         """禁言。未指定时长时按随机区间取值。"""
         group_id = event.get_group_id()
+        if ban_time not in (None, ""):
+            parsed = None if isinstance(ban_time, bool) else parse_int(ban_time)
+            if parsed is None or parsed < 0:
+                return "禁言时长必须是非负整数秒，0 表示解除禁言。"
         seconds = self.config.resolve_ban_time(
             self.store.value(group_id, "random_ban_time"), ban_time
         )
         targets = self._targets(event, target_id)
         if not targets:
             return "未指定要禁言的用户"
+        if seconds == 0:
+            return await self.unban(event, target_id)
 
         results: list[str] = []
         for index, tid in enumerate(targets):
             await self._throttle(index)
             try:
-                await event.bot.set_group_ban(
-                    group_id=int(group_id), user_id=int(tid), duration=seconds
-                )
+                await self._set_ban(event, tid, seconds)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(f"{LOG_TAG} 禁言失败 group={group_id} user={tid}: {exc}")
-                results.append(f"用户[{tid}]禁言失败：{exc}")
-                await self.log(event, "ban", target_id=tid, detail=str(exc), success=False)
+                label = "你" if self_target else f"用户[{tid}]"
+                results.append(f"{label}禁言失败：{exc}")
+                await self.log(event, action, target_id=tid, detail=str(exc), success=False)
                 continue
-            results.append(f"用户[{tid}]已被禁言{seconds}秒（{format_duration(seconds)}）")
-            await self.log(event, "ban", target_id=tid, detail=f"{seconds}秒")
+            if self_target:
+                results.append(f"你已被禁言{seconds}秒（{format_duration(seconds)}）")
+            else:
+                results.append(f"用户[{tid}]已被禁言{seconds}秒（{format_duration(seconds)}）")
+            await self.log(event, action, target_id=tid, detail=f"{seconds}秒")
             self._push_unban_undo(event, tid)
         return "\n".join(results)
 
+    async def ban_self(self, event: AstrMessageEvent, ban_time: Any = None) -> str:
+        """禁言当前发言者；不允许用 0 秒绕过语义变成解禁。"""
+        if isinstance(ban_time, bool):
+            return "禁我时长必须是正整数秒。"
+        if ban_time not in (None, ""):
+            parsed = parse_int(ban_time)
+            if parsed is None:
+                return "禁我时长必须是正整数秒。"
+            if parsed <= 0:
+                return "禁我时长必须大于 0 秒。"
+            ban_time = parsed
+        seconds = self.config.resolve_ban_time(
+            self.store.value(event.get_group_id(), "random_ban_time"), ban_time
+        )
+        if seconds <= 0:
+            return "禁我时长必须大于 0 秒。"
+        return await self.ban(
+            event,
+            ban_time=seconds,
+            target_id=event.get_sender_id(),
+            action="self_ban",
+            self_target=True,
+        )
+
     async def unban(self, event: AstrMessageEvent, target_id: Any = "") -> str:
         """解除禁言。"""
-        group_id = event.get_group_id()
         targets = self._targets(event, target_id)
         if not targets:
             return "未指定要解禁的用户"
@@ -93,9 +138,7 @@ class ModerationFeature(Feature):
         for index, tid in enumerate(targets):
             await self._throttle(index)
             try:
-                await event.bot.set_group_ban(
-                    group_id=int(group_id), user_id=int(tid), duration=0
-                )
+                await self._set_ban(event, tid, 0)
             except Exception as exc:  # noqa: BLE001
                 results.append(f"用户[{tid}]解禁失败：{exc}")
                 await self.log(event, "unban", target_id=tid, detail=str(exc), success=False)
@@ -105,11 +148,8 @@ class ModerationFeature(Feature):
         return "\n".join(results)
 
     def _push_unban_undo(self, event: AstrMessageEvent, target_id: str) -> None:
-        group_id = int(event.get_group_id())
-        bot = event.bot
-
         async def revert() -> None:
-            await bot.set_group_ban(group_id=group_id, user_id=int(target_id), duration=0)
+            await self._set_ban(event, target_id, 0)
 
         self.undo.push(
             event.get_group_id(),
