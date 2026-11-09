@@ -953,6 +953,26 @@ class QunStewardPlugin(Star):
     # need_auth 参数仅为兼容旧调用保留，模型不能关闭权限检查。
 
     @filter.llm_tool()
+    async def llm_delete_msg(self, event: AstrMessageEvent, message_id: str = ""):
+        """
+        撤回当前 QQ 群内的一条指定消息。仅在用户明确要求撤回时调用。
+        不知道消息 ID 时可留空，使用用户当前引用的消息；不能猜测消息 ID。
+        普通成员可请求撤回自己或机器人的消息；其他消息需要管理权限。
+        QQ 权限与撤回时限仍然适用。执行结果仅返回给模型，不直接发送群消息。
+        Args:
+            message_id(string): 目标消息的真实 message_id（可为负数），留空撤回当前引用的消息
+        """
+        if not self.cfg.enable_llm_tools:
+            yield "群务 LLM 工具未开启，未执行撤回。"
+            return
+        if reason := await self.permissions.check_llm(
+            event, "delete_msg", bot_perm=PermLevel.MEMBER, need_auth=True
+        ):
+            yield reason
+            return
+        yield await self.recall.recall_message(event, message_id)
+
+    @filter.llm_tool()
     async def llm_set_group_ban(
         self,
         event: AstrMessageEvent,
